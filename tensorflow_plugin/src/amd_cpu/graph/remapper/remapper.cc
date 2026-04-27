@@ -3125,13 +3125,14 @@ Status AddFusedBatchMatMul(RemapperContext* ctx,
   return OkStatus();
 }
 
-// Try to match a single ConcatV2 input as a GatherV2 wrapped in zero or more
-// SafeCast layers and an optional Cast.
+// Try to match a single ConcatV2 input as a GatherV2 wrapped in one or more
+// SafeCast layers and an optional Cast.  Direct GatherV2 → ConcatV2 (without
+// any SafeCast/Cast) is rejected to avoid breaking models that don't benefit
+// from fusion (e.g., DIEN).
 //
 // Supported patterns (all feed into ConcatV2):
 //   BF16:  SelectV2(IsInf(Cast(GatherV2)), ZerosLike, Cast)
 //   FP32:  SelectV2(IsInf(SelectV2(IsInf(GatherV2),..)),..,..)  (stacked)
-//   Direct: GatherV2
 //
 // On success, sets table_name, index_name, gather_axis and appends
 // intermediate node indices to remove_indices.
@@ -3190,6 +3191,11 @@ bool MatchGatherInput(const RemapperContext& ctx,
   }
 
   if (!IsGather(*cur_view->node())) return false;
+
+  // Require at least one intermediate layer (SafeCast or Cast) between
+  // GatherV2 and ConcatV2.  Direct GatherV2 → ConcatV2 has no overhead
+  // to eliminate and fusing it can break models (e.g., DIEN).
+  if (depth == 0) return false;
 
   const auto* gather_view = cur_view;
   const auto* gather_def = gather_view->node();
