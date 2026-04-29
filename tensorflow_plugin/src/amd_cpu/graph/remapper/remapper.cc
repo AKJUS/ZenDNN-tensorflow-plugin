@@ -3430,6 +3430,38 @@ void InferGroupEmbeddingDtypes(const GraphDef& graph,
   }
 }
 
+// Only delete intermediate nodes whose consumers are ALL within the fusion.
+// Shared nodes (with external consumers) must be kept alive.
+void SafeDeleteFusionNodes(const RemapperContext& ctx,
+                           const GroupEmbedding& matched,
+                           std::vector<bool>* nodes_to_delete) {
+  std::set<int> fusion_set;
+  fusion_set.insert(matched.concat);
+  for (const auto& run : matched.runs) {
+    for (int idx : run.nodes_to_remove) {
+      fusion_set.insert(idx);
+    }
+  }
+
+  for (int idx : fusion_set) {
+    if (idx == matched.concat) continue;
+    const auto* node_view = ctx.graph_view.GetNode(idx);
+    bool all_consumers_in_fusion = true;
+    for (const auto& fanout_set : node_view->GetRegularFanouts()) {
+      for (const auto& fanout : fanout_set) {
+        if (fusion_set.count(fanout.node_view()->node_index()) == 0) {
+          all_consumers_in_fusion = false;
+          break;
+        }
+      }
+      if (!all_consumers_in_fusion) break;
+    }
+    if (all_consumers_in_fusion) {
+      (*nodes_to_delete)[idx] = true;
+    }
+  }
+}
+
 // Full-fusion path: replace the entire ConcatV2 with a single multi-table
 // _ZenGroupEmbedding node.
 Status AddFullFusionGroupEmbeddingNode(RemapperContext* ctx,
@@ -3492,12 +3524,7 @@ Status AddFullFusionGroupEmbeddingNode(RemapperContext* ctx,
   mutation->AddNode(std::move(emb_node), &status);
   TF_RETURN_IF_ERROR(status);
 
-  // Mark all intermediate nodes for deletion.
-  for (const auto& run : matched.runs) {
-    for (int idx : run.nodes_to_remove) {
-      (*nodes_to_delete)[idx] = true;
-    }
-  }
+  SafeDeleteFusionNodes(*ctx, matched, nodes_to_delete);
 
   // Replace the ConcatV2: point all its consumers to the new node.
   auto* concat_view = ctx->graph_view.GetNode(matched.concat);
@@ -3524,10 +3551,11 @@ Status AddFullFusionGroupEmbeddingNode(RemapperContext* ctx,
   return OkStatus();
 }
 
-// Multi-table path: merge all runs into a single multi-table
-// _ZenGroupEmbedding.  If the only remaining non-gather input is at the
-// last ConcatV2 position, absorb it as a passthrough and eliminate the
-// ConcatV2 entirely.  Otherwise keep the ConcatV2 with reduced inputs.
+// Multi-table path: group runs into contiguous blocks separated by
+// non-matching ConcatV2 inputs.  Each block becomes one _ZenGroupEmbedding.
+// Non-matching inputs stay in their original position to preserve output
+// ordering.  If only one trailing non-matching input remains at the very
+// end and all gathers form a single block, absorb it as passthrough.
 Status AddMultiTableGroupEmbeddingNode(RemapperContext* ctx,
                                        const GroupEmbedding& matched,
                                        std::vector<bool>* invalidated_nodes,
@@ -3549,7 +3577,6 @@ Status AddMultiTableGroupEmbeddingNode(RemapperContext* ctx,
     original_inputs.push_back(concat_node.input(i));
   }
 
-  // Identify positions consumed by gather runs.
   std::set<int> consumed_positions;
   for (const auto& run : matched.runs) {
     for (int p = run.start_pos; p <= run.end_pos; ++p) {
@@ -3557,104 +3584,130 @@ Status AddMultiTableGroupEmbeddingNode(RemapperContext* ctx,
     }
   }
 
-  // Check if exactly one unconsumed position exists at the end.
+  // Group runs into contiguous blocks.  A new block starts when there
+  // is a gap (non-matching position) between adjacent runs.
+  struct RunBlock {
+    std::vector<size_t> run_indices;
+    int first_pos;
+    int last_pos;
+  };
+  std::vector<RunBlock> blocks;
+  for (size_t r = 0; r < matched.runs.size(); ++r) {
+    const auto& run = matched.runs[r];
+    bool start_new = blocks.empty();
+    if (!start_new) {
+      int prev_end = blocks.back().last_pos;
+      for (int p = prev_end + 1; p < run.start_pos; ++p) {
+        if (consumed_positions.count(p) == 0) {
+          start_new = true;
+          break;
+        }
+      }
+    }
+    if (start_new) {
+      blocks.push_back({{r}, run.start_pos, run.end_pos});
+    } else {
+      blocks.back().run_indices.push_back(r);
+      blocks.back().last_pos = run.end_pos;
+    }
+  }
+
+  // Trailing passthrough: one unconsumed position at the end, all runs
+  // in a single contiguous block.
   std::vector<int> unconsumed;
   for (int v = 0; v < n_values; ++v) {
     if (consumed_positions.count(v) == 0) unconsumed.push_back(v);
   }
   bool has_trailing_passthrough =
-      (unconsumed.size() == 1 && unconsumed[0] == n_values - 1);
+      (blocks.size() == 1 && unconsumed.size() == 1 &&
+       unconsumed[0] == n_values - 1);
 
-  // Build the single multi-table _ZenGroupEmbedding node.
-  const int num_tables = static_cast<int>(matched.runs.size());
-  int total_indices = 0;
-  std::vector<int> gathers_per_table;
-  gathers_per_table.reserve(num_tables);
-  for (const auto& run : matched.runs) {
-    int n = static_cast<int>(run.index_names.size());
-    gathers_per_table.push_back(n);
-    total_indices += n;
-  }
-
-  std::string emb_name = concat_name + "/_ZenGroupEmbedding";
-
-  zendnnl::error_handling::apilog_info(
-      "Remapper: Creating multi-table ", emb_name, " with ", num_tables,
-      " table groups, ", total_indices, " total gathers",
-      has_trailing_passthrough ? ", with trailing passthrough" : "");
-
-  NodeDef emb_node;
-  emb_node.set_name(emb_name);
-  emb_node.set_op(kZenGroupEmbedding);
-  emb_node.set_device(concat_device);
-
-  // Inputs: tables, then indices, then passthrough (if any).
-  for (const auto& run : matched.runs) {
-    emb_node.add_input(run.table_name);
-  }
-  for (const auto& run : matched.runs) {
-    for (const auto& idx_name : run.index_names) {
-      emb_node.add_input(idx_name);
-    }
-  }
-  if (has_trailing_passthrough) {
-    emb_node.add_input(original_inputs[unconsumed[0]]);
-  }
-
-  auto* attr = emb_node.mutable_attr();
-  SetAttrValue(num_tables, &(*attr)["num_tables"]);
-  SetAttrValue(total_indices, &(*attr)["N"]);
-  SetAttrValue(table_dtype, &(*attr)["T_table"]);
-  SetAttrValue(indices_dtype, &(*attr)["T_indices"]);
-  SetAttrValue(output_dtype, &(*attr)["T_output"]);
-  SetAttrValue(-1, &(*attr)["embedding_dim"]);
-  SetAttrValue(matched.runs[0].gather_axis, &(*attr)["gather_axis"]);
-  SetAttrValue(gathers_per_table, &(*attr)["gathers_per_table"]);
-  SetAttrValue(has_trailing_passthrough ? 1 : 0, &(*attr)["num_passthrough"]);
-
+  // Create one _ZenGroupEmbedding per contiguous block.
   utils::Mutation* mutation = ctx->graph_view.GetMutationBuilder();
   Status status;
-  mutation->AddNode(std::move(emb_node), &status);
-  TF_RETURN_IF_ERROR(status);
+  std::vector<std::string> block_emb_names;
 
-  for (const auto& run : matched.runs) {
-    for (int idx : run.nodes_to_remove) {
-      (*nodes_to_delete)[idx] = true;
+  for (size_t b = 0; b < blocks.size(); ++b) {
+    const auto& block = blocks[b];
+    int num_tables = static_cast<int>(block.run_indices.size());
+    int total_indices = 0;
+    std::vector<int> gathers_per_table;
+    for (size_t ri : block.run_indices) {
+      int n = static_cast<int>(matched.runs[ri].index_names.size());
+      gathers_per_table.push_back(n);
+      total_indices += n;
     }
+
+    std::string emb_name = concat_name + "/_ZenGroupEmbedding";
+    if (blocks.size() > 1) emb_name += "_" + std::to_string(b);
+    block_emb_names.push_back(emb_name);
+
+    bool block_has_pt = (has_trailing_passthrough && blocks.size() == 1);
+
+    zendnnl::error_handling::apilog_info(
+        "Remapper: Creating ", emb_name, " with ", num_tables,
+        " table groups, ", total_indices, " gathers",
+        block_has_pt ? ", with trailing passthrough" : "");
+
+    NodeDef emb_node;
+    emb_node.set_name(emb_name);
+    emb_node.set_op(kZenGroupEmbedding);
+    emb_node.set_device(concat_device);
+
+    for (size_t ri : block.run_indices)
+      emb_node.add_input(matched.runs[ri].table_name);
+    for (size_t ri : block.run_indices)
+      for (const auto& idx : matched.runs[ri].index_names)
+        emb_node.add_input(idx);
+    if (block_has_pt) emb_node.add_input(original_inputs[unconsumed[0]]);
+
+    auto* attr = emb_node.mutable_attr();
+    SetAttrValue(num_tables, &(*attr)["num_tables"]);
+    SetAttrValue(total_indices, &(*attr)["N"]);
+    SetAttrValue(table_dtype, &(*attr)["T_table"]);
+    SetAttrValue(indices_dtype, &(*attr)["T_indices"]);
+    SetAttrValue(output_dtype, &(*attr)["T_output"]);
+    SetAttrValue(-1, &(*attr)["embedding_dim"]);
+    SetAttrValue(matched.runs[block.run_indices[0]].gather_axis,
+                 &(*attr)["gather_axis"]);
+    SetAttrValue(gathers_per_table, &(*attr)["gathers_per_table"]);
+    SetAttrValue(block_has_pt ? 1 : 0, &(*attr)["num_passthrough"]);
+
+    mutation->AddNode(std::move(emb_node), &status);
+    TF_RETURN_IF_ERROR(status);
   }
 
-  if (has_trailing_passthrough) {
-    // Passthrough absorbed — replace ConcatV2 entirely.
+  SafeDeleteFusionNodes(*ctx, matched, nodes_to_delete);
+
+  if (has_trailing_passthrough && blocks.size() == 1) {
+    // Single block + trailing passthrough → replace ConcatV2 entirely.
     auto* concat_view = ctx->graph_view.GetNode(matched.concat);
-
-    auto fanouts = concat_view->GetRegularFanouts();
-    for (const auto& fanout_set : fanouts) {
-      for (const auto& fanout : fanout_set) {
+    for (const auto& fanout_set : concat_view->GetRegularFanouts())
+      for (const auto& fanout : fanout_set)
         mutation->AddOrUpdateRegularFanin(fanout.node_view(), fanout.index(),
-                                          TensorId(emb_name, 0));
-      }
-    }
-    for (const auto& ctrl_fanout : concat_view->GetControlledFanouts()) {
-      mutation->RemoveControllingFanin(ctrl_fanout.node_view(),
+                                          TensorId(block_emb_names[0], 0));
+    for (const auto& ctrl : concat_view->GetControlledFanouts()) {
+      mutation->RemoveControllingFanin(ctrl.node_view(),
                                        concat_view->node()->name());
-      mutation->AddControllingFanin(ctrl_fanout.node_view(), emb_name);
+      mutation->AddControllingFanin(ctrl.node_view(), block_emb_names[0]);
     }
-
     TF_RETURN_IF_ERROR(mutation->Apply());
-
     (*nodes_to_delete)[matched.concat] = true;
     (*invalidated_nodes)[matched.concat] = true;
   } else {
-    // Keep ConcatV2 with reduced inputs.
+    // Keep ConcatV2 — replace each contiguous block with its
+    // _ZenGroupEmbedding, preserving non-matching inputs in place.
+    std::map<int, size_t> block_start_to_idx;
+    for (size_t b = 0; b < blocks.size(); ++b)
+      block_start_to_idx[blocks[b].first_pos] = b;
+
     std::vector<std::string> new_value_inputs;
-    bool emb_inserted = false;
     for (int v = 0; v < n_values; ++v) {
-      if (consumed_positions.count(v)) {
-        if (!emb_inserted) {
-          new_value_inputs.push_back(emb_name);
-          emb_inserted = true;
-        }
-      } else {
+      auto it = block_start_to_idx.find(v);
+      if (it != block_start_to_idx.end()) {
+        new_value_inputs.push_back(block_emb_names[it->second]);
+        v = blocks[it->second].last_pos;
+      } else if (consumed_positions.count(v) == 0) {
         new_value_inputs.push_back(original_inputs[v]);
       }
     }
@@ -3674,7 +3727,6 @@ Status AddMultiTableGroupEmbeddingNode(RemapperContext* ctx,
       mutation->AddOrUpdateRegularFanin(concat_view, vi,
                                         TensorId(node_name, port));
     }
-
     {
       const std::string& axis_inp = original_inputs[n_values];
       auto colon = axis_inp.find(':');
@@ -3686,17 +3738,14 @@ Status AddMultiTableGroupEmbeddingNode(RemapperContext* ctx,
       mutation->AddOrUpdateRegularFanin(concat_view, new_n,
                                         TensorId(node_name, port));
     }
-
-    for (int fi = total_fanins - 1; fi >= new_total_fanins; --fi) {
+    for (int fi = total_fanins - 1; fi >= new_total_fanins; --fi)
       mutation->RemoveRegularFanin(concat_view, fi);
-    }
 
     AttrValue n_attr;
     n_attr.set_i(new_n);
     mutation->AddOrUpdateNodeAttr(concat_view, "N", n_attr);
 
     TF_RETURN_IF_ERROR(mutation->Apply());
-
     (*invalidated_nodes)[matched.concat] = true;
   }
 
