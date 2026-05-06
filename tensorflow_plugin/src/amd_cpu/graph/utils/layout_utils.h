@@ -44,6 +44,9 @@ bool RewriteFusedConv2D(const utils::MutableNodeView& node_view);
 // FusedMatMul is rewritten only for a limited number of fused post-ops.
 bool RewriteFusedMatMul(const utils::MutableNodeView& node_view);
 
+// Einsum is rewritten only for supported equation patterns.
+bool RewriteEinsum(const utils::MutableNodeView& node_view);
+
 //////////////////////////////////////////////////////////////////////////
 // Op-specific functions to copy attributes from old node to new node.
 //////////////////////////////////////////////////////////////////////////
@@ -64,6 +67,9 @@ void CopyAttrsZenFusedConv2D(const utils::MutableNodeView* orig_node_view,
 
 void CopyAttrsZenBatchMatMul(const utils::MutableNodeView* orig_node_view,
                              NodeDef* new_node);
+
+void CopyAttrsZenEinsum(const utils::MutableNodeView* orig_node_view,
+                        NodeDef* new_node);
 
 //////////////////////////////////////////////////////////////////////////
 // Helper function to handle layout process.

@@ -63,6 +63,7 @@ const std::vector<ZenFormatInfo>* GetZenFormatInfo() {
       // {"_FusedBatchNormEx", "_ZenFusedBatchNormEx", CopyAttrsAll,
       //  RewriteSupportedDataType},
       {"Softmax", "_ZenSoftmax", CopyAttrsAll, RewriteSupportedDataType},
+      {"Einsum", "_ZenEinsum", CopyAttrsZenEinsum, RewriteEinsum},
   };
   return &rinfo;
 }

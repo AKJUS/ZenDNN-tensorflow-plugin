@@ -197,6 +197,27 @@ cc_library(
     alwayslink = True,
 )
 
+cc_library(
+    name = "zen_einsum_kernel",
+    srcs = ["zen_einsum_kernel.cc"],
+    hdrs = [
+        "zen_einsum_patterns.h",
+        "zen_zendnnl_utils.h",
+    ],
+    copts = tf_copts(),
+    linkstatic = 1,
+    visibility = ["//visibility:public"],
+    deps = [
+        ":fill_functor",
+        ":fused_eigen_output_kernels",
+        ":zen_kernel_common",
+        ":zen_zendnnl_utils",
+        "//tensorflow_plugin/src/amd_cpu/util:common_utils",
+        "@zendnnl_repo//:zendnnl_lib",
+    ],
+    alwayslink = True,
+)
+
 ZEN_KERNELS = [
     ":zen_softmax_kernel",
     ":zen_conv2d_kernel",
@@ -206,6 +227,7 @@ ZEN_KERNELS = [
     ":zen_batch_matmul_kernels",
     ":zen_group_embedding_kernel",
     ":zen_embedding_lookup_sparse_kernel",
+    ":zen_einsum_kernel",
 ]
 
 cc_library(

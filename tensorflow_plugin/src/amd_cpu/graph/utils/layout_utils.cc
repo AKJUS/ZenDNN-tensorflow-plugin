@@ -104,6 +104,34 @@ bool RewriteFusedMatMul(const utils::MutableNodeView& node_view) {
           fused_ops == std::vector<string>{"Relu"});
 }
 
+// Helper function to check if an einsum equation is supported.
+static bool IsSupportedEinsumEquation(const std::string& equation) {
+  // Whitelist of supported patterns.
+  static const std::unordered_set<std::string> supported_equations = {
+      "ij,jk->ik",     // Standard 2D matmul
+      "abc,bcd->abd",  // 3D batch matmul with broadcast (MoE/expert projection)
+  };
+
+  return supported_equations.count(equation) > 0;
+}
+
+bool RewriteEinsum(const utils::MutableNodeView& node_view) {
+  // Check data type is supported (float, bfloat16).
+  if (!RewriteSupportedDataType(node_view)) return false;
+
+  // Get the equation attribute.
+  const NodeDef& node_def = *(node_view.node());
+  AttrSlice attr_list(node_def);
+
+  std::string equation;
+  if (!TryGetNodeAttr(attr_list, "equation", &equation)) {
+    return false;  // No equation attribute found.
+  }
+
+  // Check if equation is in supported whitelist.
+  return IsSupportedEinsumEquation(equation);
+}
+
 //////////////////////////////////////////////////////////////////////////
 // Op-specific functions to copy attributes from old node to new node.
 //////////////////////////////////////////////////////////////////////////
@@ -262,6 +290,16 @@ void CopyAttrsZenBatchMatMul(const utils::MutableNodeView* orig_node_view,
   // TODO (plugin) : Currently, true for all the cases. This has to be logically
   // set i.e., const weight - true, non-const weight - false.
   AddNodeAttr("is_cache_weight", true, new_node);
+}
+
+// Copy the attributes from Einsum op to _ZenEinsum op.
+void CopyAttrsZenEinsum(const utils::MutableNodeView* orig_node_view,
+                        NodeDef* new_node) {
+  // Setup ZenDNN specific attributes.
+  CopyZenAttrs(*(orig_node_view->node()), new_node);
+
+  // Copy all original attributes (equation, N, T).
+  CopyAllAttrs(*(orig_node_view->node()), new_node);
 }
 
 bool IsLayoutRewriteSupportedDataType(const DataType& T) {

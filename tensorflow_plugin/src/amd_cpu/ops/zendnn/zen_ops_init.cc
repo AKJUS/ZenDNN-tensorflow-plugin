@@ -27,4 +27,5 @@ void RegisterZenOps() {
   RegisterZenBatchMatMulOps();
   RegisterZenGroupEmbeddingOps();
   RegisterZenEmbeddingLookupSparseOps();
+  RegisterZenEinsumOps();
 }
