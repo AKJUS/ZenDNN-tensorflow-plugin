@@ -1,6 +1,6 @@
 # Building the ZenTF C++ Package from Source
 
-This guide walks through building the TensorFlow-ZenDNN plug-in C++ package (`ZENTF_v5.2.1_C++_SOURCE_BUILD`) from source. The package enables ZenDNN-accelerated inference via the TensorFlow C++ API on AMD CPUs.
+This guide walks through building the TensorFlow-ZenDNN plug-in C++ package (`ZENTF_v5.2.2_C++_SOURCE_BUILD`) from source. The package enables ZenDNN-accelerated inference via the TensorFlow C++ API on AMD CPUs.
 
 ---
 
@@ -72,20 +72,20 @@ Create the output directory and copy the build artifacts:
 
 ```bash
 cd <workspace>
-mkdir -p ZENTF_v5.2.1_C++_SOURCE_BUILD/lib-tensorflow-plugins
+mkdir -p ZENTF_v5.2.2_C++_SOURCE_BUILD/lib-tensorflow-plugins
 
 # Plug-in library
 cp ZenDNN_TensorFlow_Plugin/bazel-bin/tensorflow_plugin/libamdcpu_plugin_cc.so \
-   ZENTF_v5.2.1_C++_SOURCE_BUILD/lib-tensorflow-plugins/
+   ZENTF_v5.2.2_C++_SOURCE_BUILD/lib-tensorflow-plugins/
 
 # OpenMP runtime
 cp ZenDNN_TensorFlow_Plugin/bazel-bin/tensorflow_plugin/libamdcpu_plugin_cc.so.runfiles/llvm_openmp/libiomp5.so \
-   ZENTF_v5.2.1_C++_SOURCE_BUILD/lib-tensorflow-plugins/
+   ZENTF_v5.2.2_C++_SOURCE_BUILD/lib-tensorflow-plugins/
 
 # Helper scripts and sample code
-cp ZenDNN_TensorFlow_Plugin/scripts/c++/zentf_cc_api_setup.sh  ZENTF_v5.2.1_C++_SOURCE_BUILD/
-cp ZenDNN_TensorFlow_Plugin/scripts/zentf_env_setup.sh         ZENTF_v5.2.1_C++_SOURCE_BUILD/
-cp ZenDNN_TensorFlow_Plugin/examples/c++/sample_inference.cpp   ZENTF_v5.2.1_C++_SOURCE_BUILD/
+cp ZenDNN_TensorFlow_Plugin/scripts/c++/zentf_cc_api_setup.sh  ZENTF_v5.2.2_C++_SOURCE_BUILD/
+cp ZenDNN_TensorFlow_Plugin/scripts/zentf_env_setup.sh         ZENTF_v5.2.2_C++_SOURCE_BUILD/
+cp ZenDNN_TensorFlow_Plugin/examples/c++/sample_inference.cpp   ZENTF_v5.2.2_C++_SOURCE_BUILD/
 ```
 
 ### Step 5 -- Download and Extract TensorFlow Headers & Libraries
@@ -97,14 +97,14 @@ TF_VERSION="2.21.0"    # must match the installed version
 
 mkdir -p tf_wheel_tmp
 pip download "tensorflow==${TF_VERSION}" --no-deps --only-binary=:all: -d tf_wheel_tmp
-unzip tf_wheel_tmp/tensorflow*.whl -d "ZENTF_v5.2.1_C++_SOURCE_BUILD/tensorflow_${TF_VERSION}"
+unzip tf_wheel_tmp/tensorflow*.whl -d "ZENTF_v5.2.2_C++_SOURCE_BUILD/tensorflow_${TF_VERSION}"
 rm -rf tf_wheel_tmp
 ```
 
 Create the required symlinks:
 
 ```bash
-cd "ZENTF_v5.2.1_C++_SOURCE_BUILD/tensorflow_${TF_VERSION}/tensorflow"
+cd "ZENTF_v5.2.2_C++_SOURCE_BUILD/tensorflow_${TF_VERSION}/tensorflow"
 ln -s libtensorflow_cc.so.2        libtensorflow_cc.so
 ln -s libtensorflow_framework.so.2 libtensorflow_framework.so
 cd <workspace>
@@ -113,7 +113,7 @@ cd <workspace>
 ### Step 6 -- Set Environment Variables
 
 ```bash
-cd <workspace>/ZENTF_v5.2.1_C++_SOURCE_BUILD
+cd <workspace>/ZENTF_v5.2.2_C++_SOURCE_BUILD
 
 # Sets TF_CC_API_ZENDNN_ROOT, LIBRARY_PATH, LD_LIBRARY_PATH,
 # and creates the libomp.so.5 symlink.

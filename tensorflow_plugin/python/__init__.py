@@ -33,9 +33,9 @@ if sys.version_info >= (3, 8):
   try:
     __version__ = metadata.version('zentf')
   except metadata.PackageNotFoundError:
-    __version__ = '5.2.1'
+    __version__ = '5.2.2'
 else:
-  __version__ = '5.2.1'
+  __version__ = '5.2.2'
 
 
 def show_config():
