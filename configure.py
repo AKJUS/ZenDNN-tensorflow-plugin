@@ -325,7 +325,7 @@ def _get_version_config_dir(tf_minor):
 
 def _get_zentf_version(tf_minor):
   """Return the zentf package version for the given TF minor version."""
-  return '5.2.2'
+  return '5.2.1'
 
 
 def _get_bazel_version_for_tf(tf_minor):

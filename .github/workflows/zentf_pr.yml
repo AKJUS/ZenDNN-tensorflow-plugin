@@ -70,7 +70,7 @@ jobs:
     if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch'}} 
     env:
       PYTHON_VERSION: '3.12'
-      ZENDNN_VERSION: '5.2.2'
+      ZENDNN_VERSION: '5.2.1'
       ZENDNN_TF_VERSION: '2.21.0'
       NATIVE_TF_VERSION: '2.21.0'
       KERNELS_LIST: "avgpool maxpool softmax conv2d fusedConv2D fusedDepthwiseConv2d fused_matmul matmul"
@@ -128,7 +128,7 @@ jobs:
            echo "🔵 TRIGGERED BY ZENDNN PR:"
            echo "   Repository: ${{ env.ZENDNN_TRIGGERING_REPO }}"
            echo "   PR Number: #${{ env.ZENDNN_TRIGGERING_PR_NUMBER }}"
-           echo "   PR Title: ${{ env.ZENDNN_TRIGGERING_PR_TITLE }}"
+           echo "   PR Title: ${ZENDNN_TRIGGERING_PR_TITLE}"
            echo "   PR Author: ${{ env.ZENDNN_TRIGGERING_PR_AUTHOR }}"
            echo "   PR URL: ${{ env.ZENDNN_TRIGGERING_PR_URL }}"
            echo "   Original Event: ${{ env.ZENDNN_TRIGGERING_EVENT }}"
@@ -146,7 +146,7 @@ jobs:
            echo "🟡 TRIGGERED BY ZENDNN_TOOLS PR:"
            echo "   Repository: ${{ env.TRIGGERING_REPO }}"
            echo "   PR Number: #${{ env.TRIGGERING_PR_NUMBER }}"
-           echo "   PR Title: ${{ env.TRIGGERING_PR_TITLE }}"
+           echo "   PR Title: ${TRIGGERING_PR_TITLE}"
            echo "   PR Author: ${{ env.TRIGGERING_PR_AUTHOR }}"
            echo "   PR URL: ${{ env.TRIGGERING_PR_URL }}"
            echo "   Original Event: ${{ env.TRIGGERING_EVENT }}"
@@ -227,13 +227,15 @@ jobs:
       - name: Checkout PR tip commit
         if: github.event_name == 'pull_request'
         working-directory: ${{ github.workspace }}
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
          echo " Checking out PR tip commit..."
          echo "Current commit: $(git rev-parse HEAD)"
          echo "PR HEAD SHA: ${{ github.event.pull_request.head.sha }}"
          git checkout ${{ github.event.pull_request.head.sha }}
          echo " Now on commit: $(git rev-parse HEAD)"
-         echo "PR #${{ github.event.pull_request.number }} - ${{ github.event.pull_request.title }}"  
+         echo "PR #${{ github.event.pull_request.number }} - ${PR_TITLE}"
       - name: PR INFO
         shell: bash
         run: |
@@ -482,7 +484,7 @@ jobs:
     if: ${{ github.event_name == 'push' }}
     env:
       PYTHON_VERSION: '3.12'
-      ZENDNN_VERSION: '5.2.2'
+      ZENDNN_VERSION: '5.2.1'
       ZENDNN_TF_VERSION: '2.21.0'
       NATIVE_TF_VERSION: '2.21.0'
       KERNELS_LIST: "avgpool maxpool softmax conv2d fusedConv2D fusedDepthwiseConv2d fused_matmul matmul"
