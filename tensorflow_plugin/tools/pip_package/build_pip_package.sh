@@ -87,6 +87,7 @@ function prepare_src() {
 
   cp tensorflow_plugin/tools/pip_package/MANIFEST.in ${TMPDIR}
   cp tensorflow_plugin/tools/pip_package/DESCRIPTION.md ${TMPDIR}
+  cp tensorflow_plugin/tools/pip_package/DESCRIPTION_weekly.md ${TMPDIR}
   cp tensorflow_plugin/tools/pip_package/setup.py ${TMPDIR}
   # zentf directory should be the same with _MY_PLUGIN_PATH in setup.py
   mkdir -p ${TMPDIR}/zentf
@@ -96,6 +97,23 @@ function prepare_src() {
 
   # Extract zentf commit hash (strip newlines to avoid syntax errors)
   ZENTF_COMMIT_HASH=$(git rev-parse HEAD 2>/dev/null | tr -d '\n\r' || echo "unknown")
+  export ZENTF_BUILD_COMMIT="${ZENTF_COMMIT_HASH}"
+
+  # Detect source tag: env var > exact tag on HEAD only
+  if [ -n "${ZENTF_SOURCE_TAG:-}" ]; then
+    SOURCE_TAG="${ZENTF_SOURCE_TAG}"
+  else
+    SOURCE_TAG=$(git describe --tags --exact-match HEAD 2>/dev/null | tr -d '\n\r' || true)
+  fi
+  export ZENTF_SOURCE_TAG="${SOURCE_TAG}"
+
+  # Resolve the commit hash that the source tag points to
+  if [ -n "$SOURCE_TAG" ]; then
+    TAG_COMMIT=$(git rev-list -n 1 "$SOURCE_TAG" 2>/dev/null | tr -d '\n\r' || echo "")
+  else
+    TAG_COMMIT=""
+  fi
+  export ZENTF_TAG_COMMIT="${TAG_COMMIT}"
 
   # Extract ZenDNN/ZenDNNL version from workspace.bzl
   # Try multiple patterns to handle both original and local build modified workspace.bzl:
@@ -112,6 +130,7 @@ function prepare_src() {
 
   # Get TensorFlow version (strip newlines)
   TF_VERSION=$("${PYTHON_BIN_PATH:-python}" -c 'import tensorflow as tf; print(tf.__version__)' 2>/dev/null | tr -d '\n\r' || echo "unknown")
+  export TF_VERSION
 
   # Generate _build_info.py with version information using echo to avoid heredoc issues
   echo $(date) : "=== Generating _build_info.py"
@@ -137,6 +156,9 @@ function prepare_src() {
     echo "__zentf_commit__ = \"${ZENTF_COMMIT_HASH}\""
     echo "__zendnn_version__ = \"${ZENDNN_VERSION}\""
     echo "__tf_version__ = \"${TF_VERSION}\""
+    echo "__source_tag__ = \"${SOURCE_TAG}\""
+    echo "__tag_commit__ = \"${TAG_COMMIT}\""
+    echo "__release_type__ = \"${ZENTF_RELEASE_TYPE:-ga}\""
   } > ${TMPDIR}/zentf/_build_info.py
 
   if [ -d ${TMPDIR}/tensorflow_plugin ] ; then

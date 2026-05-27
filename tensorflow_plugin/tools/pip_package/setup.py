@@ -1,5 +1,5 @@
 #*******************************************************************************
-# Copyright (c) 2023-2024 Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (c) 2023-2026 Advanced Micro Devices, Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,9 +15,11 @@
 #
 #*******************************************************************************
 
+import datetime
 import fnmatch
 import os
 import re
+
 import sys
 
 from setuptools import Command
@@ -25,12 +27,37 @@ from setuptools import setup
 from setuptools.command.install import install as InstallCommandBase
 from setuptools.dist import Distribution
 
-# This version string is semver compatible, but incompatible with pip.
-# For pip, we will remove all '-' characters from this string, and use the
-# result for pip.
-# Also update tensorflow/amd_cpu_plugin.bzl and
-# tensorflow/core/public/version.h
-_VERSION = '5.2.1'
+# Auto-detect TF version from package metadata (avoids importing TF).
+# Only _PLUGIN_PATCH is maintained manually.
+_PLUGIN_PATCH = '0'
+
+def _detect_tf_version():
+  """Return a clean MAJOR.MINOR.PATCH.PLUGIN_PATCH version string.
+
+  Checks TF_VERSION env var first (set by build_pip_package.sh), then
+  probes package metadata for tensorflow, tensorflow-cpu, and tf-nightly.
+  Strips pre/post/dev markers (rc, .post, .dev) to produce a valid
+  PEP 440 version.
+  """
+  import re as _re
+  raw = os.environ.get('TF_VERSION', '')
+  if not raw:
+    from importlib.metadata import version as _pkg_version
+    for dist_name in ('tensorflow', 'tensorflow-cpu', 'tf-nightly'):
+      try:
+        raw = _pkg_version(dist_name)
+        break
+      except Exception:
+        continue
+  if not raw:
+    return '2.21.0.%s' % _PLUGIN_PATCH
+  clean = _re.split(r'(\.dev|\.post|rc|-)', raw)[0]
+  parts = clean.split('.')[:3]
+  while len(parts) < 3:
+    parts.append('0')
+  return '%s.%s.%s.%s' % (parts[0], parts[1], parts[2], _PLUGIN_PATCH)
+
+_VERSION = _detect_tf_version()
 # this path can't be modified.
 _PLUGIN_LIB_PATH = 'tensorflow-plugins'
 _MY_PLUGIN_PATH = 'zentf'
@@ -43,8 +70,23 @@ if sys.byteorder == 'little':
   # See https://github.com/tensorflow/tensorflow/issues/17882.
   REQUIRED_PACKAGES.append('grpcio >= 1.8.6')
 
-# The wheel package name, change it as your requirements.
-project_name = 'zentf'
+# ZENTF_RELEASE_TYPE: "ga" (default) or "weekly"
+_RELEASE_TYPE = os.environ.get('ZENTF_RELEASE_TYPE', 'ga').lower()
+
+if _RELEASE_TYPE == 'weekly':
+  project_name = 'zentf-weekly'
+  _dev_date = (
+      os.environ.get('ZENTF_WEEKLY_DATE', '')
+      or datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d')
+  )
+  if not (_dev_date.isdigit() and len(_dev_date) == 8):
+    raise RuntimeError(
+        f"Invalid ZENTF_WEEKLY_DATE value: {_dev_date!r}. "
+        "It must be an 8-digit date in YYYYMMDD format (e.g., 20250318)."
+    )
+  _VERSION = _VERSION + '.dev' + _dev_date
+else:
+  project_name = 'zentf'
 
 # numpy v1.26.4 requires to perform zentf well with TF v2.18.
 REQUIRED_PACKAGES.append('numpy == 1.26.4')
@@ -184,9 +226,39 @@ headers = (
     list(find_files('*.h', 'tensorflow-plugins/c_api/src')))
 
 curr_dir = os.path.dirname(__file__)
+_tf_ver = os.environ.get('TF_VERSION', 'N/A')
+
 long_description = ""
-with open(os.path.join(curr_dir, "DESCRIPTION.md"), encoding="utf-8") as f:
+_desc_file = "DESCRIPTION_weekly.md" if _RELEASE_TYPE == 'weekly' else "DESCRIPTION.md"
+with open(os.path.join(curr_dir, _desc_file), encoding="utf-8") as f:
   long_description = f.read()
+long_description = long_description.replace('{{TF_VERSION}}', _tf_ver)
+
+_source_tag = os.environ.get('ZENTF_SOURCE_TAG', '')
+_tag_commit = os.environ.get('ZENTF_TAG_COMMIT', '')
+_build_commit = os.environ.get('ZENTF_BUILD_COMMIT', '')
+
+_GITHUB_REPO = "https://github.com/amd/ZenDNN-tensorflow-plugin"
+_build_info_section = "\n## Build Information\n\n"
+_build_info_section += "| Field | Value |\n|---|---|\n"
+if _source_tag:
+  _build_info_section += f"| Source Tag | `{_source_tag}` |\n"
+  _build_info_section += f"| Tag Commit | `{_tag_commit[:12]}` |\n"
+if _build_commit:
+  _build_info_section += f"| Build Commit | `{_build_commit[:12]}` |\n"
+_build_info_section += f"| TensorFlow Version | `{_tf_ver}` |\n"
+_build_info_section += f"| Release Type | `{_RELEASE_TYPE}` |\n"
+if _source_tag:
+  _tag_url = f"{_GITHUB_REPO}/releases/tag/{_source_tag}"
+  _build_info_section += f"\nBuilt from [{_source_tag}]({_tag_url})\n"
+long_description += _build_info_section
+
+_project_urls = {
+    **({
+        "Source Tag": f"{_GITHUB_REPO}/releases/tag/{_source_tag}"
+    } if _source_tag else {}),
+    "Source": _GITHUB_REPO,
+}
 
 setup(
     name=project_name,
@@ -195,6 +267,7 @@ setup(
     long_description=long_description,
     long_description_content_type='text/markdown',
     url='https://developer.amd.com/zendnn',
+    project_urls=_project_urls,
     author='AMD',
     author_email='zendnn.maintainers@amd.com',
     # Contained modules and scripts.

@@ -1,5 +1,5 @@
 #*******************************************************************************
-# Modifications Copyright (c) 2025 Advanced Micro Devices, Inc. All rights
+# Modifications Copyright (c) 2025-2026 Advanced Micro Devices, Inc. All rights
 # reserved. Notified per clause 4(b) of the license.
 #*******************************************************************************
 #
@@ -323,10 +323,6 @@ def _get_version_config_dir(tf_minor):
     return 'tf_2.21'
 
 
-def _get_zentf_version(tf_minor):
-  """Return the zentf package version for the given TF minor version."""
-  return '5.2.1'
-
 
 def _get_bazel_version_for_tf(tf_minor):
   """Return the required Bazel version string for the given TF minor version.
@@ -406,24 +402,6 @@ def apply_version_config(tf_minor):
       with open(bazelrc_path, 'w') as f:
         f.write(bazelrc_content)
       print('  Added --noenable_bzlmod to .bazelrc')
-
-  # Set zentf package version in setup.py
-  zentf_ver = _get_zentf_version(tf_minor)
-  setup_py_path = os.path.join(
-      _TF_WORKSPACE_ROOT, 'tensorflow_plugin',
-      'tools', 'pip_package', 'setup.py')
-  if os.path.exists(setup_py_path):
-    with open(setup_py_path, 'r') as f:
-      setup_content = f.read()
-    import re as _re
-    new_content = _re.sub(
-        r"_VERSION = '[^']*'",
-        "_VERSION = '%s'" % zentf_ver,
-        setup_content)
-    if new_content != setup_content:
-      with open(setup_py_path, 'w') as f:
-        f.write(new_content)
-      print('  Set zentf version to %s in setup.py' % zentf_ver)
 
   print('Version configuration complete for TensorFlow %s\n' % tf_ver_str)
 
