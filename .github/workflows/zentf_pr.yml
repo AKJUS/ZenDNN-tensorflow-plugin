@@ -168,7 +168,7 @@ jobs:
          echo ""
         shell: bash 
       - name: Checkout ZenDNN_TensorFlow_Plugin
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -398,7 +398,7 @@ jobs:
         
       - name: Archive build artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: zentf-artifacts
           path: |
@@ -510,7 +510,7 @@ jobs:
          ls -al $GITHUB_WORKSPACE
         shell: bash
       - name: Checkout ZenDNN_TensorFlow_Plugin
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -725,7 +725,7 @@ jobs:
         
       - name: Archive build artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: zentf-artifacts
           path: |

@@ -1,5 +1,5 @@
 # ******************************************************************************
-# Copyright (c) 2025 Advanced Micro Devices, Inc.
+# Copyright (c) 2025-2026 Advanced Micro Devices, Inc.
 # All rights reserved.
 # ******************************************************************************
 name: ZenDNN_TF_Plugin_SA_Keyword_Check
@@ -34,7 +34,7 @@ jobs:
         shell: bash
         
       - name: Checkout ZenDNN_TensorFlow_Plugin
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -79,7 +79,7 @@ jobs:
 
       - name: Upload Artifacts
         if: always() 
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: precheck-results
           path: |
