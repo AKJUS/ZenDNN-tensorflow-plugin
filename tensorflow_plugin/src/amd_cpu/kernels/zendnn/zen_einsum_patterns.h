@@ -45,10 +45,11 @@ enum class EinsumPatternType {
 // Structure to hold decomposition information for an einsum pattern.
 // This tells the kernel how to execute the einsum using ZenDNN primitives.
 struct EinsumDecomposition {
-  EinsumPatternType pattern;
-  bool transpose_a;
-  bool transpose_b;
-  int num_inputs;  // Number of input tensors (1 or 2 for supported patterns)
+  EinsumPatternType pattern = EinsumPatternType::kUnsupported;
+  bool transpose_a = false;
+  bool transpose_b = false;
+  int num_inputs = 2;  // Default value; overwritten by AnalyzeEinsumPattern()
+                       // based on the matched einsum pattern
 };
 
 // Get the pattern type for an einsum equation.
