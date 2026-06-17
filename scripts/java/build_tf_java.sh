@@ -44,7 +44,7 @@ if ! command -v bazel &> /dev/null; then
     # curl -fsSL https://bazel.build/bazel-release.pub.gpg | gpg --dearmor >bazel-archive-keyring.gpg
     # sudo mv bazel-archive-keyring.gpg /usr/share/keyrings
     # echo "deb [arch=amd64 signed-by=/usr/share/keyrings/bazel-archive-keyring.gpg] https://storage.googleapis.com/bazel-apt stable jdk1.8" | sudo tee /etc/apt/sources.list.d/bazel.list
-    # sudo apt update && sudo apt install bazel-7.4.1
+    # sudo apt update && sudo apt install bazel-7.7.0
     return 1
 else
     echo "bazel version: $(bazel version)"
@@ -70,7 +70,7 @@ fi
 echo ""
 
 # Checkout to the commit hash.
-git checkout 75402befedce0e1cf847b6f93d654b708a7db1db
+git checkout 1bbd7d953b83dc7a5ad1ac2356adb6d69d693d4c
 
 # Build TensorFlow Java.
 if ! mvn clean install; then
