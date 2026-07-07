@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Modifications Copyright (c) 2025 Advanced Micro Devices, Inc. All rights
+ * Modifications Copyright (c) 2026 Advanced Micro Devices, Inc. All rights
  * reserved. Notified per clause 4(b) of the license.
  ******************************************************************************/
 
@@ -67,7 +67,11 @@ Status InitializeFusedComputation(
       *fused_computation == FusedComputationType::kBiasAddWithRelu6 ||
       *fused_computation == FusedComputationType::kBiasAddWithTanh ||
       *fused_computation == FusedComputationType::kBiasAddWithElu ||
-      *fused_computation == FusedComputationType::kBiasAddWithLeakyRelu) {
+      *fused_computation == FusedComputationType::kBiasAddWithLeakyRelu ||
+      *fused_computation == FusedComputationType::kBiasAddWithSigmoid ||
+      *fused_computation == FusedComputationType::kBiasAddWithMish ||
+      *fused_computation == FusedComputationType::kBiasAddWithGeluApproximate ||
+      *fused_computation == FusedComputationType::kBiasAddWithGeluExact) {
     if (num_args != 1) {
       return errors::InvalidArgument(
           "Fused ", kernel_name,

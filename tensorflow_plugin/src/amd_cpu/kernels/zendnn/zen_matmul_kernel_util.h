@@ -178,7 +178,7 @@ class ZenMatMulPrimitive : public ZenPrimitive {
     if (!post_op_params.empty()) {
       for (auto const &post_op_param : post_op_params) {
         if (post_op_param.name == "relu" || post_op_param.name == "sigmoid" ||
-            post_op_param.name == "tanh" ||
+            post_op_param.name == "tanh" || post_op_param.name == "mish" ||
             post_op_param.name == "GeluApproximate" ||
             post_op_param.name == "GeluExact") {
           DCHECK_EQ(post_op_param.param.size(), 3);
@@ -197,6 +197,9 @@ class ZenMatMulPrimitive : public ZenPrimitive {
                                     op_alpha, op_beta);
           } else if (post_op_param.name == "tanh") {
             post_ops.append_eltwise(op_scale, algorithm::eltwise_tanh, op_alpha,
+                                    op_beta);
+          } else if (post_op_param.name == "mish") {
+            post_ops.append_eltwise(op_scale, algorithm::eltwise_mish, op_alpha,
                                     op_beta);
           } else if (post_op_param.name == "GeluApproximate") {
             post_ops.append_eltwise(op_scale, algorithm::eltwise_gelu, op_alpha,
@@ -304,7 +307,8 @@ class ZenMatMulPrimitiveFactory : public ZenPrimitiveFactory {
     for (auto const &post_op_param : matmul_dims.post_op_params) {
       if (post_op_param.name == "relu" || post_op_param.name == "sigmoid" ||
           post_op_param.name == "GeluApproximate" ||
-          post_op_param.name == "tanh" || post_op_param.name == "GeluExact") {
+          post_op_param.name == "tanh" || post_op_param.name == "mish" ||
+          post_op_param.name == "GeluExact") {
         DCHECK_EQ(post_op_param.param.size(), 3);
         key_creator.AddAsKey(post_op_param.name);
         key_creator.AddAsKey(post_op_param.param[0]);

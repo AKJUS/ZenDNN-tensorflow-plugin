@@ -160,6 +160,12 @@ bool TryExecuteZenDNNLMatMul(OpKernelContext *context, const Tensor &a,
           params.postop_.push_back(sigmoid_op);
           break;
         }
+        case FusedComputationType::kBiasAddWithMish: {
+          matmul_post_op mish_op;
+          mish_op.po_type = post_op_type_t::mish;
+          params.postop_.push_back(mish_op);
+          break;
+        }
         case FusedComputationType::kBiasAddWithTanh: {
           matmul_post_op tanh_op;
           tanh_op.po_type = post_op_type_t::tanh;
@@ -317,6 +323,11 @@ bool TryExecuteZenDNNLMatMul(OpKernelContext *context, const Tensor &a,
           matmul_context.set_post_op(sigmoid_post_op);
           break;
         }
+        case FusedComputationType::kBiasAddWithMish: {
+          post_op_t mish_post_op(post_op_type_t::mish);
+          matmul_context.set_post_op(mish_post_op);
+          break;
+        }
         case FusedComputationType::kBiasAddWithGeluApproximate: {
           post_op_t gelu_post_op(post_op_type_t::gelu_tanh);
           matmul_context.set_post_op(gelu_post_op);
@@ -458,6 +469,7 @@ class ZenMatMulOp : public OpKernel {
           {FCT::kBiasAddWithAdd, {"BiasAdd", "Add"}},
           {FCT::kBiasAddWithRelu, {"BiasAdd", "Relu"}},
           {FCT::kBiasAddWithSigmoid, {"BiasAdd", "Sigmoid"}},
+          {FCT::kBiasAddWithMish, {"BiasAdd", "Mish"}},
           {FCT::kBiasAddWithTanh, {"BiasAdd", "Tanh"}},
           {FCT::kBiasAddWithGeluExact, {"BiasAdd", "GeluExact"}},
           {FCT::kBiasAddWithAddAndRelu, {"BiasAdd", "Add", "Relu"}},

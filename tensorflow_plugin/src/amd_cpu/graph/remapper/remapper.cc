@@ -20,7 +20,13 @@ limitations under the License.
 
 #include "tensorflow_plugin/src/amd_cpu/graph/remapper/remapper.h"
 
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdlib>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "tensorflow_plugin/src/amd_cpu/graph/remapper/constant_names.h"
 #include "tensorflow_plugin/src/amd_cpu/graph/utils/graph_common_utils.h"
@@ -202,6 +208,22 @@ struct ContractionWithActivation {
   int activation = kMissingIndex;
 };
 
+// _FusedMatMul -> Softplus -> Tanh -> Mul(x, tanh(softplus(x))) (decomposed
+// Mish), fused to _FusedMatMul + Mish post-op.
+struct FusedMatMulMishDecomposedMatch {
+  int contraction = kMissingIndex;
+  int mish_mul = kMissingIndex;
+  int tanh = kMissingIndex;
+  int softplus = kMissingIndex;
+  // BF16 SrcT==DstT Cast nodes between _FusedMatMul and Softplus/Mul (removed
+  // on fuse).
+  std::vector<int> noop_bf16_cast_nodes;
+  // Float->BF16 Cast on BF16 _FusedMatMul :0 when Softplus is BF16 (stale
+  // AMP/BN shim); consumers rewired to matmul output then Cast removed in
+  // AddFusedMatMulMishDecomposed.
+  std::vector<int> redundant_f32_to_bf16_cast_on_bf16_matmul_out;
+};
+
 // safe_embedding_lookup_sparse subgraph matched by the remapper.
 struct SafeEmbeddingLookupSparse {
   SafeEmbeddingLookupSparse() = default;
@@ -268,6 +290,67 @@ struct ContractionWithMul {
   int contraction = kMissingIndex;
   int mul = kMissingIndex;
   int scalar = kMissingIndex;
+};
+
+// MatMul + BiasAdd + Mul(scale) + Add|AddV2(shift) -> _FusedMatMul (updated
+// Consts).
+struct MatMulBiasMulAddFoldMatch {
+  MatMulBiasMulAddFoldMatch() = default;
+
+  int matmul = kMissingIndex;
+  int bias_add = kMissingIndex;
+  int mul = kMissingIndex;
+  int add = kMissingIndex;
+  int scale_const = kMissingIndex;
+  int shift_const = kMissingIndex;
+  int bias_port = 1;
+  // Optional Cast(BiasAdd|_FusedMatMul) -> Mul and Add|AddV2 ->
+  // Cast(DstT=Tmatmul).
+  int bias_cast = kMissingIndex;
+  int tail_cast = kMissingIndex;
+};
+
+// MatMul + BiasAdd + Keras-exported inference BN -> _FusedMatMul (updated
+// Consts). Two subgraph shapes:
+//   (1) Add|AddV2(Mul(bias×Mul(Rsqrt,gamma)), Sub(β, Mul(…, same scale))) —
+//   Keras-style. (2) Add|AddV2(Mul(Mul(Sub(BiasAdd, mean), Rsqrt), gamma),
+//   beta) — linear/raw-op BN.
+// mul_mean is only used for shape (1); kMissingIndex for shape (2).
+struct MatMulBiasKerasBnFoldMatch {
+  MatMulBiasKerasBnFoldMatch() = default;
+
+  int matmul = kMissingIndex;
+  int bias_add = kMissingIndex;
+  int mul_1 = kMissingIndex;
+  int keras_bn_add = kMissingIndex;
+  int sub = kMissingIndex;
+  int mul_scale = kMissingIndex;
+  int mul_mean = kMissingIndex;
+  int rsqrt = kMissingIndex;
+  int add_eps = kMissingIndex;
+  int gamma_const = kMissingIndex;
+  int beta_const = kMissingIndex;
+  int mean_const = kMissingIndex;
+  int variance_const = kMissingIndex;
+  float epsilon = 1e-3f;
+  int bias_port = 1;
+  int bias_cast = kMissingIndex;
+  int tail_cast = kMissingIndex;
+};
+
+// _FusedMatMul + Mul(scale) + Add|AddV2(shift). Remapper runs before Zen
+// layout, so the chain head is always _FusedMatMul here (layout renames it
+// afterward).
+struct FuseMatmulBNfoldMatch {
+  FuseMatmulBNfoldMatch() = default;
+
+  int fused_matmul = kMissingIndex;
+  int mul = kMissingIndex;
+  int add = kMissingIndex;
+  int scale_const = kMissingIndex;
+  int shift_const = kMissingIndex;
+  int bias_cast = kMissingIndex;
+  int tail_cast = kMissingIndex;
 };
 
 // A contiguous run of GatherV2 ops sharing the same table within a ConcatV2.
@@ -621,6 +704,43 @@ bool FindContractionWithBias(const RemapperContext& ctx, int node_index,
   // TODO(plugin): ZenDNN does not support double dtype currently.
   if (HasDataType(contraction_node_def, DT_DOUBLE)) return false;
 
+  // Defer MatMul+BiasAdd when BiasAdd feeds Mul→Add so MatMulBiasMulAddFold
+  // can absorb scale/shift into weights/bias in one step. Only defer if the
+  // Mul has a single fanout that is Add/AddV2 (complete BN fold pattern).
+  // Plain scale-only (Mul without Add) should fuse normally.
+  if (IsMatMul(*contraction_node_def)) {
+    const auto& bf = node_view->GetRegularFanout(0);
+    if (bf.size() == 1) {
+      const auto* fo = bf[0].node_view();
+      if (fo != nullptr && IsAnyMul(*(fo->node()))) {
+        // Only defer if Mul has single fanout to Add/AddV2 (complete BN
+        // pattern).
+        const auto& mul_fo = fo->GetRegularFanout(0);
+        if (mul_fo.size() == 1) {
+          const auto* mul_fo_node = mul_fo[0].node_view();
+          if (mul_fo_node != nullptr && IsAdd(*(mul_fo_node->node()))) {
+            return false;
+          }
+        }
+      }
+      if (fo != nullptr && IsCast(*(fo->node())) &&
+          fo->GetRegularFanout(0).size() == 1) {
+        const auto* fo2 = fo->GetRegularFanout(0)[0].node_view();
+        if (fo2 != nullptr && IsAnyMul(*(fo2->node()))) {
+          // Only defer if Mul has single fanout to Add/AddV2 (complete BN
+          // pattern).
+          const auto& mul_fo = fo2->GetRegularFanout(0);
+          if (mul_fo.size() == 1) {
+            const auto* mul_fo_node = mul_fo[0].node_view();
+            if (mul_fo_node != nullptr && IsAdd(*(mul_fo_node->node()))) {
+              return false;
+            }
+          }
+        }
+      }
+    }
+  }
+
   const ContractionWithBiasAdd pattern{contraction_node_view->node_index(),
                                        node_index, bias_port};
   // We successfully found a {Conv2D, MatMul}+BiasAdd pattern.
@@ -735,46 +855,203 @@ bool FindContractionWithActivation(const RemapperContext& ctx, int node_index,
 
 bool FindContractionWithSigmoid(const RemapperContext& ctx, int node_index,
                                 ContractionWithActivation* matched) {
-  // Get the node at the given index.
   const auto* node_view = ctx.graph_view.GetNode(node_index);
   const auto* node_def = node_view->node();
   if (node_def == nullptr) return false;
 
-  // The root of the pattern must be a Sigmoid node.
   if (!IsSigmoid(*node_def)) return false;
-
-  // Sigmoid should have no control inputs.
   if (HasControlFanin(*node_view)) return false;
-
-  // Ensure Sigmoid has at least one regular input.
   if (node_view->NumRegularFanins() < 1) return false;
+
   const auto& regular_fanin_0 = node_view->GetRegularFanin(0);
   const auto* contraction_node_view = regular_fanin_0.node_view();
   const auto* contraction_node_def = contraction_node_view->node();
 
-  // Verify the input is _FusedMatMul as we have encountered _FuseMatMul +
-  // Sigmoid.
   if (contraction_node_def->op() != "_FusedMatMul") return false;
 
-  // Check if _FusedMatMul contains only BiasAdd.
   auto fused_ops = contraction_node_def->attr().at("fused_ops").list().s();
   if (fused_ops.size() != 1 || fused_ops.at(0) != "BiasAdd") return false;
 
-  // Additional constraints for fusion.
-  if (HasControlFanout(*contraction_node_view) ||  // No control outputs.
-      !HaveSameDataType(node_def,
-                        contraction_node_def) ||  // Matching data types.
-      !HasAtMostOneFanoutAtPort0(
-          *contraction_node_view) ||                 // At most one fanout.
-      IsInPreserveSet(ctx, contraction_node_def)) {  // Not preserved.
+  if (HasControlFanout(*contraction_node_view) ||
+      !HaveSameDataType(node_def, contraction_node_def) ||
+      !HasAtMostOneFanoutAtPort0(*contraction_node_view) ||
+      IsInPreserveSet(ctx, contraction_node_def)) {
     return false;
   }
 
-  // Pattern matched; store the node indices.
   const ContractionWithActivation pattern{contraction_node_view->node_index(),
                                           node_index};
   *matched = pattern;
   return true;
+}
+
+bool FindContractionWithMish(const RemapperContext& ctx, int node_index,
+                             ContractionWithActivation* matched) {
+  const auto* node_view = ctx.graph_view.GetNode(node_index);
+  const auto* node_def = node_view->node();
+  if (node_def == nullptr || !IsMish(*node_def)) return false;
+  if (HasControlFanin(*node_view) || node_view->NumRegularFanins() < 1) {
+    return false;
+  }
+
+  const auto* contraction_node_view = node_view->GetRegularFanin(0).node_view();
+  const auto* contraction_node_def = contraction_node_view->node();
+  if (contraction_node_def->op() != "_FusedMatMul") return false;
+  if (!contraction_node_def->attr().contains("fused_ops")) return false;
+
+  auto fused_ops = contraction_node_def->attr().at("fused_ops").list().s();
+  if (fused_ops.size() != 1 || fused_ops.at(0) != "BiasAdd") return false;
+  if (HasControlFanout(*contraction_node_view) ||
+      !HaveSameDataType(node_def, contraction_node_def) ||
+      !HasAtMostOneFanoutAtPort0(*contraction_node_view) ||
+      IsInPreserveSet(ctx, contraction_node_def)) {
+    return false;
+  }
+
+  *matched = ContractionWithActivation{contraction_node_view->node_index(),
+                                       node_index};
+  return true;
+}
+
+// Defined later in this translation unit; required before
+// FindFusedMatMulMishDecomposedPattern.
+utils::MutableNodeView* SkipIdentityOnly(utils::MutableNodeView* v,
+                                         int max_hops = 16);
+bool GetCastDataTypes(const NodeDef& n, DataType* src_t, DataType* dst_t);
+bool IsNoopBf16Cast(const NodeDef& n);
+void MishDecomposedAppendUniqueCast(std::vector<int>* v, int node_index);
+utils::MutableNodeView* SkipIdentityOrNoopBf16CastTowardProducer(
+    utils::MutableNodeView* v, bool allow_bf16_noop_cast_on_chain,
+    std::vector<int>* noop_bf16_cast_indices);
+bool MishDecomposedForwardReachesSoftplusOrMul(
+    utils::MutableNodeView* start, int target_node_index,
+    bool allow_bf16_noop_cast_forward, const NodeDef* fused_def,
+    const NodeDef* endpoint_dtype_node);
+bool MishDecomposedIsStaleF32ToBf16CastOnBf16MatmulOutput(
+    const NodeDef* fused_def, const utils::MutableNodeView* child);
+bool MishDecomposedCastHasAnyRegularConsumer(const utils::MutableNodeView* v);
+bool MishDecomposedVerifyMatmulOutputOnlySoftplusAndMul(
+    utils::MutableNodeView* fused_view, utils::MutableNodeView* sp_view,
+    int mish_mul_node_index, const NodeDef* fused_def, const NodeDef* mul_def);
+
+bool FindFusedMatMulMishDecomposedPattern(
+    const RemapperContext& ctx, int node_index,
+    FusedMatMulMishDecomposedMatch* matched) {
+  auto* mul_view = ctx.graph_view.GetNode(node_index);
+  if (mul_view == nullptr) return false;
+  const auto* mul_def = mul_view->node();
+  if (mul_def == nullptr || !IsAnyMul(*mul_def)) return false;
+  if (HasControlFanin(*mul_view)) return false;
+  if (mul_view->NumRegularFanins() != 2) return false;
+
+  for (int p = 0; p < 2; ++p) {
+    std::vector<int> noop_bf16_casts_to_remove;
+    std::vector<int> redundant_f32_to_bf16_cast_on_bf16_mm;
+    utils::MutableNodeView* bypass = const_cast<utils::MutableNodeView*>(
+        mul_view->GetRegularFanin(p).node_view());
+    utils::MutableNodeView* branch = const_cast<utils::MutableNodeView*>(
+        mul_view->GetRegularFanin(1 - p).node_view());
+    if (bypass == nullptr || branch == nullptr) continue;
+    bypass = SkipIdentityOrNoopBf16CastTowardProducer(
+        bypass, HasDataType(mul_def, DT_BFLOAT16), &noop_bf16_casts_to_remove);
+    branch = SkipIdentityOnly(branch);
+    if (bypass == nullptr || branch == nullptr) continue;
+
+    const NodeDef* branch_def = branch->node();
+    if (branch_def == nullptr || !IsTanh(*branch_def)) continue;
+    if (HasControlFaninOrFanout(*branch)) continue;
+    if (branch->NumRegularFanins() < 1) continue;
+
+    utils::MutableNodeView* sp_view = const_cast<utils::MutableNodeView*>(
+        branch->GetRegularFanin(0).node_view());
+    if (sp_view == nullptr) continue;
+    sp_view = SkipIdentityOnly(sp_view);
+    if (sp_view == nullptr || sp_view->node() == nullptr ||
+        !IsSoftplus(*(sp_view->node())))
+      continue;
+    if (HasControlFaninOrFanout(*sp_view)) continue;
+    if (sp_view->NumRegularFanins() < 1) continue;
+
+    utils::MutableNodeView* from_sp = const_cast<utils::MutableNodeView*>(
+        sp_view->GetRegularFanin(0).node_view());
+    if (from_sp == nullptr) continue;
+    from_sp = SkipIdentityOrNoopBf16CastTowardProducer(
+        from_sp, HasDataType(sp_view->node(), DT_BFLOAT16),
+        &noop_bf16_casts_to_remove);
+    if (from_sp == nullptr || bypass->node_index() != from_sp->node_index()) {
+      continue;
+    }
+
+    const NodeDef* fused_def = from_sp->node();
+    if (fused_def == nullptr || fused_def->op() != "_FusedMatMul") continue;
+
+    if (!fused_def->attr().contains("fused_ops")) continue;
+    auto fused_ops = fused_def->attr().at("fused_ops").list().s();
+    if (fused_ops.size() != 1 || fused_ops.at(0) != "BiasAdd") continue;
+    if (HasDataType(fused_def, DT_DOUBLE)) continue;
+    if (IsInPreserveSet(ctx, fused_def) || IsInPreserveSet(ctx, mul_def) ||
+        IsInPreserveSet(ctx, branch_def) ||
+        IsInPreserveSet(ctx, sp_view->node())) {
+      continue;
+    }
+    if (!HaveSameDataType(mul_def, fused_def) ||
+        !HaveSameDataType(branch_def, mul_def)) {
+      continue;
+    }
+
+    if (HasDataType(fused_def, DT_BFLOAT16) &&
+        HasDataType(sp_view->node(), DT_BFLOAT16)) {
+      for (const auto& fo : from_sp->GetRegularFanout(0)) {
+        const utils::MutableNodeView* cv = fo.node_view();
+        if (!MishDecomposedIsStaleF32ToBf16CastOnBf16MatmulOutput(fused_def,
+                                                                  cv)) {
+          continue;
+        }
+        MishDecomposedAppendUniqueCast(&redundant_f32_to_bf16_cast_on_bf16_mm,
+                                       cv->node_index());
+      }
+    }
+
+    if (HasControlFanin(*from_sp) || HasControlFanout(*from_sp)) continue;
+    if (!MishDecomposedVerifyMatmulOutputOnlySoftplusAndMul(
+            from_sp, sp_view, node_index, fused_def, mul_def)) {
+      continue;
+    }
+    if (!HasAtMostOneFanoutAtPort0(*sp_view) ||
+        !HasAtMostOneFanoutAtPort0(*branch)) {
+      continue;
+    }
+
+    const GraphDef* gpreserve = ctx.graph_view.graph();
+    bool cast_in_preserve = false;
+    for (int cix : noop_bf16_casts_to_remove) {
+      if (cix >= 0 && cix < gpreserve->node_size() &&
+          IsInPreserveSet(ctx, &gpreserve->node(cix))) {
+        cast_in_preserve = true;
+        break;
+      }
+    }
+    if (!cast_in_preserve) {
+      for (int cix : redundant_f32_to_bf16_cast_on_bf16_mm) {
+        if (cix >= 0 && cix < gpreserve->node_size() &&
+            IsInPreserveSet(ctx, &gpreserve->node(cix))) {
+          cast_in_preserve = true;
+          break;
+        }
+      }
+    }
+    if (cast_in_preserve) continue;
+
+    matched->contraction = from_sp->node_index();
+    matched->mish_mul = node_index;
+    matched->tanh = branch->node_index();
+    matched->softplus = sp_view->node_index();
+    matched->noop_bf16_cast_nodes = std::move(noop_bf16_casts_to_remove);
+    matched->redundant_f32_to_bf16_cast_on_bf16_matmul_out =
+        std::move(redundant_f32_to_bf16_cast_on_bf16_mm);
+    return true;
+  }
+  return false;
 }
 
 bool FindContractionWithBiasAndActivation(
@@ -1602,7 +1879,9 @@ bool FindMatMulBiasAddAndGelu(RemapperContext* ctx, int node_index,
               {
                 {"Tanh", "tanh", NodeStatus::kRemove,
                   {
-                    {"Mul", "matmul_plus_mul_times_square_root_two_over_pi", NodeStatus::kRemove,
+                    {"Mul",
+                     "matmul_plus_mul_times_square_root_two_over_pi",
+                     NodeStatus::kRemove,
                       {
                         {"Add|AddV2", "matmul_plus_mul", NodeStatus::kRemove,
                           {
@@ -1610,7 +1889,9 @@ bool FindMatMulBiasAddAndGelu(RemapperContext* ctx, int node_index,
                             *subgraph_pattern
                           }
                         },  // Add|AddV2: matmul_plus_mul
-                        {"Const", "square_root_two_over_pi", NodeStatus::kRemain}
+                        {"Const",
+                         "square_root_two_over_pi",
+                         NodeStatus::kRemain}
                       }
                     }  // Mul: matmul_plus_mul_times_square_root_two_over_pi
                   }
@@ -1628,12 +1909,13 @@ bool FindMatMulBiasAddAndGelu(RemapperContext* ctx, int node_index,
   // Pattern 2:
   //    Const:                      Emperical     1/sqrt(2)             1
   //                                   \                 \               \
-  //  FusedMatMul --> Square --> Mul --> Mul --> AddV2 --> Mul --> Tanh --> AddV2  --> Mul
-  //           \\\_______________/              /                                    /
-  //            \\_____________________________/                                    /
-  //             \______________________________________________________________ Mul
-  //                                                                             /
-  //                                                                         Const: 1/2
+  //  FusedMatMul --> Square --> Mul --> Mul --> AddV2 --> Mul --> Tanh -->
+  //  AddV2  --> Mul
+  //           \\\_______________/              /                            /
+  //            \\_____________________________/                            /
+  //             \______________________________________________________ Mul
+  //                                                                      /
+  //                                                                  Const: 1/2
   gelu_approximate_patterns.push_back(
   {"Mul", "output", NodeStatus::kReplace,
     {
@@ -1647,7 +1929,9 @@ bool FindMatMulBiasAddAndGelu(RemapperContext* ctx, int node_index,
         {
           {"Tanh", "tanh", NodeStatus::kRemove,
             {
-              {"Mul", "matmul_plus_mul_times_square_root_two_over_pi", NodeStatus::kRemove,
+              {"Mul",
+               "matmul_plus_mul_times_square_root_two_over_pi",
+               NodeStatus::kRemove,
                 {
                   {"Add|AddV2", "matmul_plus_mul", NodeStatus::kRemove,
                     {
@@ -1655,12 +1939,15 @@ bool FindMatMulBiasAddAndGelu(RemapperContext* ctx, int node_index,
                       {"Mul", "mul", NodeStatus::kRemove,
                         {
                           {"Const", "empirical_const", NodeStatus::kRemain},
-                          {"Mul", "empirical_const_times_matmul", NodeStatus::kRemove,
+                          {"Mul",
+                           "empirical_const_times_matmul",
+                           NodeStatus::kRemove,
                             {
                               {"_FusedMatMul", "matmul", NodeStatus::kRemove},
                               {"Square", "square", NodeStatus::kRemove,
                                 {
-                                  {"_FusedMatMul", "matmul", NodeStatus::kRemove}
+                                  {"_FusedMatMul", "matmul",
+                                   NodeStatus::kRemove}
                                 }
                               }  // Square: square
                             }
@@ -1669,7 +1956,9 @@ bool FindMatMulBiasAddAndGelu(RemapperContext* ctx, int node_index,
                       }  // Mul: mul
                     }
                   },  // Add|AddV2: matmul_plus_mul
-                  {"Const", "square_root_two_over_pi", NodeStatus::kRemain}
+                  {"Const",
+                   "square_root_two_over_pi",
+                   NodeStatus::kRemain}
                 }
               }  // Mul: matmul_plus_mul_times_square_root_two_over_pi
             }
@@ -1681,12 +1970,17 @@ bool FindMatMulBiasAddAndGelu(RemapperContext* ctx, int node_index,
   });  // Mul: output
 
   // Pattern 3:
-  //    Const:   ExpandDims                   Emperical        1/sqrt(2)       Const: 1    Const: 1/2
-  //                \                              \                 \                \         \
-  //  FusedMatMul --> Reshape --> Square --> Mul --> Mul --> AddV2 --> Mul --> Tanh --> AddV2 --> Mul --> Mul
-  //                      \\\_______________/              /                                            /
-  //                       \\_____________________________/                                            /
-  //                        \_________________________________________________________________________/
+  //    Const:   ExpandDims                   Emperical        1/sqrt(2)
+  //    Const: 1    Const: 1/2
+  //                \                              \                 \
+  //                \         \
+  //  FusedMatMul --> Reshape --> Square --> Mul --> Mul --> AddV2 --> Mul -->
+  //  Tanh --> AddV2 --> Mul --> Mul
+  //                      \\\_______________/              /
+  //                                            /
+  //                       \\_____________________________/
+  //                                            /
+  //                        \______________________________________________/
   gelu_approximate_patterns.push_back(
   {"Mul", "output", NodeStatus::kReplace,
     {
@@ -1696,34 +1990,46 @@ bool FindMatMulBiasAddAndGelu(RemapperContext* ctx, int node_index,
             {
               {"Tanh", "tanh", NodeStatus::kRemove,
                 {
-                  {"Mul", "matmul_plus_mul_times_square_root_two_over_pi", NodeStatus::kRemove,
+                  {"Mul",
+                   "matmul_plus_mul_times_square_root_two_over_pi",
+                   NodeStatus::kRemove,
                     {
                       {"Add|AddV2", "matmul_plus_mul", NodeStatus::kRemove,
                         {
                           {"Reshape", "reshape", NodeStatus::kRemove},
                           {"Mul", "mul", NodeStatus::kRemove,
                             {
-                              {"Mul", "empirical_const_times_matmul", NodeStatus::kRemove,
+                              {"Mul",
+                               "empirical_const_times_matmul",
+                               NodeStatus::kRemove,
                                 {
                                   {"Reshape", "reshape", NodeStatus::kRemove,
                                     {
-                                      {"_FusedMatMul", "matmul", NodeStatus::kRemove},
-                                      {"Cast|Const", "expand_dims", NodeStatus::kRemain}
+                                      {"_FusedMatMul", "matmul",
+                                       NodeStatus::kRemove},
+                                      {"Cast|Const",
+                                       "expand_dims",
+                                       NodeStatus::kRemain}
                                     }
                                   },  // Reshape: reshape
                                   {"Square", "square", NodeStatus::kRemove,
                                     {
-                                      {"Reshape", "reshape", NodeStatus::kRemove}
+                                      {"Reshape", "reshape",
+                                       NodeStatus::kRemove}
                                     }
                                   }  // Square: square
                                 }
                               },  // Mul: empirical_const_times_matmul
-                              {"Cast|Const", "empirical_const", NodeStatus::kRemain}
+                              {"Cast|Const",
+                               "empirical_const",
+                               NodeStatus::kRemain}
                             }
                           }  // Mul: mul
                         }
                       },  // Add|AddV2: matmul_plus_mul
-                      {"Cast|Const", "square_root_two_over_pi", NodeStatus::kRemain}
+                      {"Cast|Const",
+                       "square_root_two_over_pi",
+                       NodeStatus::kRemain}
                     }
                   }  // Mul: matmul_plus_mul_times_square_root_two_over_pi
                 }
@@ -1739,14 +2045,19 @@ bool FindMatMulBiasAddAndGelu(RemapperContext* ctx, int node_index,
   });  // Mul: output
 
   // Pattern BF16:
-  //    Const:                    Emperical                1/sqrt(2)                      1
-  //                                   \                         \                         \
-  //  FusedMatMul --> Cast --> Square --> Mul --> Mul --> AddV2 --> Mul --> Cast --> Tanh --> AddV2  --> Mul
-  //            \      \\\______________________/       /                                             /
-  //             \      \\_____________________________/                                             /
-  //              \______________________________________________________________________________ Mul
-  //                                                                                              /
-  //                                                                                          Const: 1/2
+  //    Const:                    Emperical                1/sqrt(2)
+  //    1
+  //                                   \                         \
+  //                                   \
+  //  FusedMatMul --> Cast --> Square --> Mul --> Mul --> AddV2 --> Mul -->
+  //  Cast --> Tanh --> AddV2  --> Mul
+  //            \      \\\______________________/       /
+  //                                             /
+  //             \      \\_____________________________/
+  //                                             /
+  //              \______________________________________________________ Mul
+  //                                                                      /
+  //                                                                  Const: 1/2
   gelu_approximate_patterns.push_back(
   {"Mul", "output", NodeStatus::kReplace,
     {
@@ -1762,30 +2073,39 @@ bool FindMatMulBiasAddAndGelu(RemapperContext* ctx, int node_index,
             {
               {"Cast", "cast1", NodeStatus::kRemove,
                 {
-                  {"Mul", "matmul_plus_mul_times_square_root_two_over_pi", NodeStatus::kRemove,
+                  {"Mul",
+                   "matmul_plus_mul_times_square_root_two_over_pi",
+                   NodeStatus::kRemove,
                     {
                       {"AddV2", "matmul_plus_mul", NodeStatus::kRemove,
                         {
                           {"Cast", "cast", NodeStatus::kRemove,
                             {
-                              {"_FusedMatMul", "matmul", NodeStatus::kRemove}
+                              {"_FusedMatMul", "matmul",
+                               NodeStatus::kRemove}
                             }
                           },  // Cast: cast
                           {"Mul", "mul", NodeStatus::kRemove,
                             {
                               {"Cast", "cast", NodeStatus::kRemove,
                                 {
-                                  {"_FusedMatMul", "matmul", NodeStatus::kRemove}
+                                  {"_FusedMatMul", "matmul",
+                                   NodeStatus::kRemove}
                                 }
                               },  // Cast: cast
-                              {"Mul", "empirical_const_times_matmul", NodeStatus::kRemove,
+                              {"Mul",
+                               "empirical_const_times_matmul",
+                               NodeStatus::kRemove,
                                 {
-                                  {"Const", "empirical_const", NodeStatus::kRemain},
+                                  {"Const",
+                                   "empirical_const",
+                                   NodeStatus::kRemain},
                                   {"Square", "square", NodeStatus::kRemove,
                                     {
                                       {"Cast", "cast", NodeStatus::kRemove,
                                         {
-                                          {"_FusedMatMul", "matmul", NodeStatus::kRemove}
+                                          {"_FusedMatMul", "matmul",
+                                           NodeStatus::kRemove}
                                         }
                                       }  // Cast: cast
                                     }
@@ -1796,7 +2116,9 @@ bool FindMatMulBiasAddAndGelu(RemapperContext* ctx, int node_index,
                           }  // Mul: mul
                         }
                       },  // AddV2: matmul_plus_mul
-                      {"Const", "square_root_two_over_pi", NodeStatus::kRemain}
+                      {"Const",
+                       "square_root_two_over_pi",
+                       NodeStatus::kRemain}
                     }
                   }  // Mul: matmul_plus_mul_times_square_root_two_over_pi
                 }
@@ -2236,6 +2558,32 @@ void CopyMatMulAttributes(const NodeDef& matmul, NodeDef* fused_matmul,
   // }
 }
 
+// MatMul, _ZenMatMul, and BatchMatMul* share T on _FusedMatMul; BatchMatMul
+// uses adj_x/adj_y which map to transpose_a/transpose_b on _FusedMatMul.
+void CopyMatMulLikeAttributes(const NodeDef& src, NodeDef* fused_matmul) {
+  auto* attr = fused_matmul->mutable_attr();
+  auto& src_attr = src.attr();
+  (*attr)["T"] = src_attr.at("T");
+  if (IsAnyBatchMatMul(src) || src.op() == "_ZenBatchMatMul" ||
+      src.op() == "_ZenBatchMatMulV2") {
+    bool ax = src_attr.contains("adj_x") && src_attr.at("adj_x").b();
+    bool ay = src_attr.contains("adj_y") && src_attr.at("adj_y").b();
+    (*attr)["transpose_a"].set_b(ax);
+    (*attr)["transpose_b"].set_b(ay);
+    return;
+  }
+  if (src_attr.contains("transpose_a")) {
+    (*attr)["transpose_a"] = src_attr.at("transpose_a");
+  } else {
+    (*attr)["transpose_a"].set_b(false);
+  }
+  if (src_attr.contains("transpose_b")) {
+    (*attr)["transpose_b"] = src_attr.at("transpose_b");
+  } else {
+    (*attr)["transpose_b"].set_b(false);
+  }
+}
+
 void CopyFusedBatchNormAttributes(const NodeDef& fused_batch_norm,
                                   NodeDef* fused_batch_norm_ex) {
   DCHECK(IsFusedBatchNorm(fused_batch_norm))
@@ -2362,6 +2710,9 @@ Status AddFusedContractionNode(RemapperContext* ctx,
     fused_node.set_op(kFusedMatMul);
     CopyMatMulAttributes(contraction, &fused_node);
     // TODO(plugin) : Explore if _ZenFusedBatchMatMul is a simple possibility.
+  } else if (IsAnyBatchMatMul(contraction)) {
+    fused_node.set_op(kFusedMatMul);
+    CopyMatMulLikeAttributes(contraction, &fused_node);
   } else {
     CHECK(false);
   }
@@ -2414,6 +2765,9 @@ Status AddFusedContractionNode(RemapperContext* ctx,
   } else if (IsMatMul(contraction)) {
     fused_node.set_op(kFusedMatMul);
     CopyMatMulAttributes(contraction, &fused_node);
+  } else if (IsAnyBatchMatMul(contraction)) {
+    fused_node.set_op(kFusedMatMul);
+    CopyMatMulLikeAttributes(contraction, &fused_node);
   } else {
     CHECK(false);
   }
@@ -2462,6 +2816,9 @@ Status AddFusedContractionNode(
   } else if (IsMatMul(contraction)) {
     fused_node.set_op(kFusedMatMul);
     CopyMatMulAttributes(contraction, &fused_node);
+  } else if (IsAnyBatchMatMul(contraction)) {
+    fused_node.set_op(kFusedMatMul);
+    CopyMatMulLikeAttributes(contraction, &fused_node);
   } else {
     CHECK(false);
   }
@@ -2499,17 +2856,15 @@ Status AddFusedMatMulSigmoidNode(RemapperContext* ctx,
   NodeDef fused_node;
   fused_node.set_name(activation.name());  // Name it after the Sigmoid node.
   fused_node.set_device(
-      contraction.device());  // Use the device of the original _FusedMatMul.
+      contraction.device());  // Use the device of the original fused matmul.
+  fused_node.set_op(contraction.op());
+
+  CopyAllAttrs(contraction, &fused_node);
+  fused_node.clear_input();
   fused_node.add_input(
       contraction.input(0));  // Input tensor (e.g., from concat).
   fused_node.add_input(contraction.input(1));  // Filter (constant kernel).
   fused_node.add_input(contraction.input(2));  // Bias (constant bias).
-
-  // Set the operation to _FusedMatMul.
-  fused_node.set_op(kFusedMatMul);
-
-  // Copy attributes from the original _FusedMatMul.
-  CopyMatMulAttributes(contraction, &fused_node);
 
   // Set the fused operations to include both BiasAdd and Sigmoid.
   SetFusedOpAttributesWithActivation(&fused_node, &activation, {"BiasAdd"});
@@ -2524,6 +2879,112 @@ Status AddFusedMatMulSigmoidNode(RemapperContext* ctx,
   // Mark the original _FusedMatMul for deletion and the Sigmoid as invalidated.
   (*nodes_to_delete)[matched.contraction] = true;
   (*invalidated_nodes)[matched.activation] = true;
+
+  return OkStatus();
+}
+
+Status AddFusedMatMulMishNode(RemapperContext* ctx,
+                              const ContractionWithActivation& matched,
+                              std::vector<bool>* invalidated_nodes,
+                              std::vector<bool>* nodes_to_delete) {
+  const GraphDef* graph = ctx->graph_view.graph();
+  const NodeDef& contraction =
+      graph->node(matched.contraction);  // _FusedMatMul (MatMul + BiasAdd).
+  const NodeDef& activation = graph->node(matched.activation);  // Mish.
+
+  zendnnl::error_handling::apilog_info("Remapper: Fusing ", contraction.op(),
+                                       " (", contraction.name(),
+                                       ") with Mish activation");
+
+  NodeDef fused_node;
+  fused_node.set_name(activation.name());
+  fused_node.set_device(contraction.device());
+  fused_node.add_input(contraction.input(0));
+  fused_node.add_input(contraction.input(1));
+  fused_node.add_input(contraction.input(2));
+
+  fused_node.set_op(kFusedMatMul);
+
+  CopyMatMulAttributes(contraction, &fused_node);
+
+  SetFusedOpAttributesWithActivation(&fused_node, &activation, {"BiasAdd"});
+
+  utils::Mutation* mutation = ctx->graph_view.GetMutationBuilder();
+  Status status;
+  mutation->AddNode(std::move(fused_node), &status);
+  TF_ABORT_IF_ERROR(status);
+  TF_ABORT_IF_ERROR(mutation->Apply());
+
+  (*nodes_to_delete)[matched.contraction] = true;
+  (*invalidated_nodes)[matched.activation] = true;
+
+  return OkStatus();
+}
+
+Status AddFusedMatMulMishDecomposed(
+    RemapperContext* ctx, const FusedMatMulMishDecomposedMatch& matched,
+    std::vector<bool>* invalidated_nodes, std::vector<bool>* nodes_to_delete) {
+  const GraphDef* graph = ctx->graph_view.graph();
+  const NodeDef& contraction = graph->node(matched.contraction);
+  const NodeDef& mul = graph->node(matched.mish_mul);
+
+  if (!matched.redundant_f32_to_bf16_cast_on_bf16_matmul_out.empty()) {
+    const string& contraction_out_name = contraction.name();
+    SafeTensorId safe_contraction_out(contraction_out_name, 0);
+    const TensorId contraction_tid(safe_contraction_out);
+    for (int cix : matched.redundant_f32_to_bf16_cast_on_bf16_matmul_out) {
+      utils::MutableNodeView* cast_view = ctx->graph_view.GetNode(cix);
+      if (cast_view == nullptr) continue;
+      utils::Mutation* cast_mut = ctx->graph_view.GetMutationBuilder();
+      for (const auto& fo_set : cast_view->GetRegularFanouts()) {
+        for (const auto& fo : fo_set) {
+          cast_mut->AddOrUpdateRegularFanin(fo.node_view(), fo.index(),
+                                            contraction_tid);
+        }
+      }
+      for (const auto& ctrl : cast_view->GetControlledFanouts()) {
+        cast_mut->RemoveControllingFanin(ctrl.node_view(),
+                                         cast_view->node()->name());
+        cast_mut->AddControllingFanin(ctrl.node_view(), contraction_out_name);
+      }
+      TF_RETURN_IF_ERROR(cast_mut->Apply());
+    }
+  }
+
+  zendnnl::error_handling::apilog_info("Remapper: Fusing ", contraction.op(),
+                                       " (", contraction.name(),
+                                       ") with Mish (decomposed)");
+
+  NodeDef fused_node;
+  fused_node.set_name(mul.name());
+  fused_node.set_device(contraction.device());
+  fused_node.add_input(contraction.input(0));
+  fused_node.add_input(contraction.input(1));
+  fused_node.add_input(contraction.input(2));
+  fused_node.set_op(kFusedMatMul);
+  CopyMatMulAttributes(contraction, &fused_node);
+  SetFusedOpAttributes(&fused_node, {"BiasAdd", "Mish"}, 1);
+
+  utils::Mutation* mutation = ctx->graph_view.GetMutationBuilder();
+  Status status;
+  mutation->AddNode(std::move(fused_node), &status);
+  TF_ABORT_IF_ERROR(status);
+  TF_ABORT_IF_ERROR(mutation->Apply());
+
+  (*nodes_to_delete)[matched.contraction] = true;
+  (*nodes_to_delete)[matched.softplus] = true;
+  (*nodes_to_delete)[matched.tanh] = true;
+  (*invalidated_nodes)[matched.mish_mul] = true;
+  for (int cix : matched.noop_bf16_cast_nodes) {
+    if (cix >= 0 && cix < graph->node_size()) {
+      (*nodes_to_delete)[cix] = true;
+    }
+  }
+  for (int cix : matched.redundant_f32_to_bf16_cast_on_bf16_matmul_out) {
+    if (cix >= 0 && cix < graph->node_size()) {
+      (*nodes_to_delete)[cix] = true;
+    }
+  }
 
   return OkStatus();
 }
@@ -2550,6 +3011,9 @@ Status AddFusedContractionNode(RemapperContext* ctx,
   if (IsMatMul(contraction)) {
     fused_node.set_op(kFusedMatMul);
     CopyMatMulAttributes(contraction, &fused_node);
+  } else if (IsAnyBatchMatMul(contraction)) {
+    fused_node.set_op(kFusedMatMul);
+    CopyMatMulLikeAttributes(contraction, &fused_node);
   } else {
     CHECK(false);
   }
@@ -2605,6 +3069,9 @@ Status AddFusedContractionNode(
   } else if (IsMatMul(contraction)) {
     fused_node.set_op(kFusedMatMul);
     CopyMatMulAttributes(contraction, &fused_node);
+  } else if (IsAnyBatchMatMul(contraction)) {
+    fused_node.set_op(kFusedMatMul);
+    CopyMatMulLikeAttributes(contraction, &fused_node);
   } else {
     CHECK(false);
   }
@@ -3766,6 +4233,1963 @@ Status AddGroupEmbeddingNode(RemapperContext* ctx,
                                          nodes_to_delete);
 }
 
+bool IsFusedMatMulBiasAddOnly(const NodeDef& node) {
+  if (node.op() != kFusedMatMul && node.op() != "_ZenFusedMatMul") return false;
+  if (!node.attr().contains("fused_ops")) return false;
+  const auto& fused_ops = node.attr().at("fused_ops").list().s();
+  if (fused_ops.size() != 1 || fused_ops[0] != "BiasAdd") return false;
+  int num_args = 0;
+  Status num_args_st = GetNodeAttr(node, "num_args", &num_args);
+  if (num_args_st.ok()) {
+    if (num_args != 1) return false;
+  } else if (node.input_size() < 3) {
+    // Some imported graphs omit num_args; three inputs (a, b, bias) imply one
+    // arg.
+    return false;
+  }
+  return node.input_size() >= 3;
+}
+
+bool FuseMatmulBNfoldTensorShapesOk(const Tensor& weight, const Tensor& bias,
+                                    const Tensor& scale, const Tensor& shift,
+                                    DataType t) {
+  // MatMul T may be BF16 while frozen weights/bias stay FP32 Const (mixed
+  // precision); fold in float then cast updated values to BF16 for the Const.
+  const bool weight_bias_types_ok =
+      (weight.dtype() == t && bias.dtype() == t) ||
+      (t == DT_BFLOAT16 && weight.dtype() == DT_FLOAT &&
+       bias.dtype() == DT_FLOAT);
+  if (!weight_bias_types_ok) {
+    return false;
+  }
+  if (scale.dtype() != t || shift.dtype() != t) {
+    if (t != DT_BFLOAT16 || scale.dtype() != DT_FLOAT ||
+        shift.dtype() != DT_FLOAT) {
+      return false;
+    }
+  }
+  if (t != DT_FLOAT && t != DT_BFLOAT16) return false;
+  if (weight.dims() != 2) return false;
+  const int64_t n_out = weight.dim_size(1);
+  if (bias.NumElements() != n_out || scale.NumElements() != n_out ||
+      shift.NumElements() != n_out) {
+    return false;
+  }
+  return true;
+}
+
+void ApplyFuseMatmulBNfoldToTensors(Tensor* weight, Tensor* bias,
+                                    const Tensor& scale, const Tensor& shift,
+                                    DataType t) {
+  const int64_t k_in = weight->dim_size(0);
+  const int64_t n_out = weight->dim_size(1);
+  if (t == DT_FLOAT) {
+    auto w = weight->matrix<float>();
+    auto bv = bias->flat<float>();
+    auto sv = scale.flat<float>();
+    auto hv = shift.flat<float>();
+    for (int64_t j = 0; j < n_out; ++j) {
+      const float s = sv(j);
+      for (int64_t k = 0; k < k_in; ++k) w(k, j) *= s;
+      bv(j) = bv(j) * s + hv(j);
+    }
+    return;
+  }
+  if (t == DT_BFLOAT16 && weight->dtype() == DT_FLOAT &&
+      bias->dtype() == DT_FLOAT) {
+    // Fold in-place on FP32 tensors, then allocate BF16 outputs once (no extra
+    // full-matrix copies of W/B before the math).
+    auto w_mat = weight->matrix<float>();
+    auto bv_flat = bias->flat<float>();
+    if (scale.dtype() == DT_FLOAT && shift.dtype() == DT_FLOAT) {
+      auto sv = scale.flat<float>();
+      auto hv = shift.flat<float>();
+      for (int64_t j = 0; j < n_out; ++j) {
+        const float s = sv(j);
+        const float h = hv(j);
+        for (int64_t k = 0; k < k_in; ++k) w_mat(k, j) *= s;
+        bv_flat(j) = bv_flat(j) * s + h;
+      }
+    } else {
+      auto sv = scale.flat<Eigen::bfloat16>();
+      auto hv = shift.flat<Eigen::bfloat16>();
+      for (int64_t j = 0; j < n_out; ++j) {
+        const float s = static_cast<float>(sv(j));
+        const float h = static_cast<float>(hv(j));
+        for (int64_t k = 0; k < k_in; ++k) w_mat(k, j) *= s;
+        bv_flat(j) = bv_flat(j) * s + h;
+      }
+    }
+    Tensor w_out(DT_BFLOAT16, weight->shape());
+    Tensor b_out(DT_BFLOAT16, bias->shape());
+    auto w_dst = w_out.matrix<Eigen::bfloat16>();
+    auto b_dst = b_out.flat<Eigen::bfloat16>();
+    for (int64_t j = 0; j < n_out; ++j) {
+      for (int64_t k = 0; k < k_in; ++k) {
+        w_dst(k, j) = Eigen::bfloat16(w_mat(k, j));
+      }
+      b_dst(j) = Eigen::bfloat16(bv_flat(j));
+    }
+    *weight = std::move(w_out);
+    *bias = std::move(b_out);
+    return;
+  }
+  if (t == DT_BFLOAT16) {
+    auto w = weight->matrix<Eigen::bfloat16>();
+    auto bv = bias->flat<Eigen::bfloat16>();
+    if (scale.dtype() == DT_FLOAT && shift.dtype() == DT_FLOAT) {
+      auto sv = scale.flat<float>();
+      auto hv = shift.flat<float>();
+      for (int64_t j = 0; j < n_out; ++j) {
+        const float s = sv(j);
+        const float h = hv(j);
+        for (int64_t k = 0; k < k_in; ++k) {
+          w(k, j) = Eigen::bfloat16(static_cast<float>(w(k, j)) * s);
+        }
+        bv(j) = Eigen::bfloat16(static_cast<float>(bv(j)) * s + h);
+      }
+    } else {
+      auto sv = scale.flat<Eigen::bfloat16>();
+      auto hv = shift.flat<Eigen::bfloat16>();
+      for (int64_t j = 0; j < n_out; ++j) {
+        const float s = static_cast<float>(sv(j));
+        const float h = static_cast<float>(hv(j));
+        for (int64_t k = 0; k < k_in; ++k) {
+          w(k, j) = Eigen::bfloat16(static_cast<float>(w(k, j)) * s);
+        }
+        bv(j) = Eigen::bfloat16(static_cast<float>(bv(j)) * s + h);
+      }
+    }
+  }
+}
+
+// Follow Identity / StopGradient / Cast to the Const feeding a tensor input.
+// Each hop must have a single data fanout and no control edges.
+int PeelToConstProducerNodeIndex(const RemapperContext& ctx,
+                                 utils::MutableNodeView* v) {
+  for (int depth = 0; depth < 16 && v != nullptr; ++depth) {
+    const NodeDef* nd = v->node();
+    if (nd == nullptr) return -1;
+    if (IsInPreserveSet(ctx, nd)) return -1;
+    if (HasControlFaninOrFanout(*v)) return -1;
+    if (!HasAtMostOneFanoutAtPort0(*v)) return -1;
+    if (IsAnyConst(*nd)) return v->node_index();
+    const string& op = nd->op();
+    if ((op == "Identity" || op == "StopGradient" || op == kCast) &&
+        v->NumRegularFanins() >= 1) {
+      v = v->GetRegularFanin(0).node_view();
+      continue;
+    }
+    // Frozen graphs often wrap variables as ReadVariableOp -> Const (or
+    // Identity).
+    if (op == "ReadVariableOp" && v->NumRegularFanins() >= 1) {
+      v = v->GetRegularFanin(0).node_view();
+      continue;
+    }
+    return -1;
+  }
+  return -1;
+}
+
+// TF 2.x often emits BatchMatMulV2 for tf.matmul. Also accept _ZenMatMul /
+// _ZenBatchMatMul* when those ops are already present in the GraphDef fed to
+// the remapper (the Zen plugin runs remapper before Zen layout in
+// cpu_optimizer).
+bool IsZenBatchMatMulLayoutOp(const NodeDef& node) {
+  const auto& op = node.op();
+  return op == "_ZenBatchMatMul" || op == "_ZenBatchMatMulV2";
+}
+
+bool IsMatMulZenOrBatchMatMul(const NodeDef& node) {
+  return IsMatMul(node) || node.op() == "_ZenMatMul" ||
+         IsAnyBatchMatMul(node) || IsZenBatchMatMulLayoutOp(node);
+}
+
+bool MatMulLikeNoTransposeOrAdj(const NodeDef& node) {
+  if (IsMatMul(node) || node.op() == "_ZenMatMul") {
+    bool ta = false, tb = false;
+    if (node.attr().contains("transpose_a")) {
+      ta = node.attr().at("transpose_a").b();
+    }
+    if (node.attr().contains("transpose_b")) {
+      tb = node.attr().at("transpose_b").b();
+    }
+    return !ta && !tb;
+  }
+  if (IsAnyBatchMatMul(node) || IsZenBatchMatMulLayoutOp(node)) {
+    bool ax = false, ay = false;
+    if (node.attr().contains("adj_x")) {
+      ax = node.attr().at("adj_x").b();
+    }
+    if (node.attr().contains("adj_y")) {
+      ay = node.attr().at("adj_y").b();
+    }
+    return !ax && !ay;
+  }
+  return false;
+}
+
+// BN-fold rewrites the contraction into a strictly 2-D _FusedMatMul. A plain
+// MatMul / _ZenMatMul is inherently rank-2, but BatchMatMul* (which TF 2.x can
+// emit even for tf.matmul) may carry batch dimensions. Folding a genuine
+// rank-3+ batched op into a 2-D _FusedMatMul would silently drop the batch
+// dimension, so only allow batched ops whose operands are statically rank-2.
+// Unknown rank (Rank() == -1) is rejected conservatively.
+bool MatMulFoldRankOk(const RemapperContext& ctx, const NodeDef& node) {
+  if (!IsAnyBatchMatMul(node) && !IsZenBatchMatMulLayoutOp(node)) {
+    return true;
+  }
+  std::vector<OpInfo_TensorProperties> props;
+  if (!ctx.graph_properties.GetInputProperties(node.name(), &props).ok()) {
+    return false;
+  }
+  if (props.size() < 2) {
+    return false;
+  }
+  return Rank(props[0].shape()) == 2 && Rank(props[1].shape()) == 2;
+}
+
+bool MatchMulScaleBiasAddTail(
+    const RemapperContext& ctx, const utils::MutableNodeView* mul_view,
+    const utils::MutableNodeView* shift_view,
+    const utils::MutableNodeView** fused_or_bias_view_out,
+    const utils::MutableNodeView** scale_view_out,
+    const utils::MutableNodeView** shift_const_view_out) {
+  if (mul_view == nullptr || shift_view == nullptr) return false;
+  const auto* mul_def = mul_view->node();
+  if (mul_def == nullptr) return false;
+  if (!IsAnyMul(*mul_def)) return false;
+  // Incoming control edges can prevent reordering; outgoing control edges are
+  // common on TF executor graphs and are preserved when mutating fanins.
+  if (HasControlFanin(*mul_view) || mul_view->NumRegularFanins() != 2 ||
+      IsInPreserveSet(ctx, mul_def)) {
+    return false;
+  }
+
+  utils::MutableNodeView* shift_mutable = const_cast<utils::MutableNodeView*>(
+      ctx.graph_view.GetNode(shift_view->node_index()));
+  int shift_const_ix = PeelToConstProducerNodeIndex(ctx, shift_mutable);
+  if (shift_const_ix < 0) return false;
+  const auto* shift_const_view = ctx.graph_view.GetNode(shift_const_ix);
+  // Match the scale_const checks below: a control edge on the shift Const would
+  // be lost when the node is deleted, so reject it here too.
+  if (HasControlFaninOrFanout(*shift_const_view) ||
+      !HasAtMostOneFanoutAtPort0(*shift_const_view))
+    return false;
+
+  for (int mul_fm_port = 0; mul_fm_port < 2; ++mul_fm_port) {
+    const auto* chain_view = mul_view->GetRegularFanin(mul_fm_port).node_view();
+    utils::MutableNodeView* scale_mutable = const_cast<utils::MutableNodeView*>(
+        mul_view->GetRegularFanin(1 - mul_fm_port).node_view());
+    if (chain_view == nullptr || scale_mutable == nullptr) continue;
+    const auto* chain_def = chain_view->node();
+    if (chain_def == nullptr) continue;
+    int scale_ix = PeelToConstProducerNodeIndex(ctx, scale_mutable);
+    if (scale_ix < 0) continue;
+    const auto* scale_const_view = ctx.graph_view.GetNode(scale_ix);
+    if (HasControlFaninOrFanout(*scale_const_view) ||
+        !HasAtMostOneFanoutAtPort0(*scale_const_view)) {
+      continue;
+    }
+    *fused_or_bias_view_out = chain_view;
+    *scale_view_out = scale_const_view;
+    *shift_const_view_out = shift_const_view;
+    return true;
+  }
+  return false;
+}
+
+bool GetCastDataTypes(const NodeDef& n, DataType* src_t, DataType* dst_t) {
+  if (!IsCast(n)) return false;
+  if (!n.attr().contains("SrcT") || !n.attr().contains("DstT")) return false;
+  *src_t = n.attr().at("SrcT").type();
+  *dst_t = n.attr().at("DstT").type();
+  return true;
+}
+
+bool IsNoopBf16Cast(const NodeDef& n) {
+  DataType st, dt;
+  if (!GetCastDataTypes(n, &st, &dt)) return false;
+  return st == DT_BFLOAT16 && dt == DT_BFLOAT16;
+}
+
+bool MishDecomposedIsStaleF32ToBf16CastOnBf16MatmulOutput(
+    const NodeDef* fused_def, const utils::MutableNodeView* child) {
+  if (fused_def == nullptr || child == nullptr || child->node() == nullptr) {
+    return false;
+  }
+  if (!HasDataType(fused_def, DT_BFLOAT16)) return false;
+  if (!IsCast(*(child->node()))) return false;
+  if (HasControlFaninOrFanout(*child)) return false;
+  DataType st = DT_INVALID, dt = DT_INVALID;
+  if (!GetCastDataTypes(*(child->node()), &st, &dt)) return false;
+  return st == DT_FLOAT && dt == DT_BFLOAT16;
+}
+
+bool MishDecomposedCastHasAnyRegularConsumer(const utils::MutableNodeView* v) {
+  if (v == nullptr) return false;
+  for (int i = 0; i < v->NumRegularFanouts(); ++i) {
+    if (!v->GetRegularFanout(i).empty()) return true;
+  }
+  return false;
+}
+
+void MishDecomposedAppendUniqueCast(std::vector<int>* v, int node_index) {
+  if (v == nullptr) return;
+  if (std::find(v->begin(), v->end(), node_index) == v->end()) {
+    v->push_back(node_index);
+  }
+}
+
+utils::MutableNodeView* SkipIdentityOrNoopBf16CastTowardProducer(
+    utils::MutableNodeView* v, bool allow_bf16_noop_cast_on_chain,
+    std::vector<int>* noop_bf16_cast_indices) {
+  for (int h = 0; h < 16 && v != nullptr; ++h) {
+    NodeDef* nd = v->node();
+    if (nd == nullptr) break;
+    if (nd->op() == "Identity") {
+      if (v->NumRegularFanins() < 1) break;
+      v = v->GetRegularFanin(0).node_view();
+      continue;
+    }
+    if (allow_bf16_noop_cast_on_chain && IsCast(*nd) && IsNoopBf16Cast(*nd)) {
+      if (v->NumRegularFanins() < 1) break;
+      MishDecomposedAppendUniqueCast(noop_bf16_cast_indices, v->node_index());
+      v = v->GetRegularFanin(0).node_view();
+      continue;
+    }
+    break;
+  }
+  return v;
+}
+
+bool MishDecomposedForwardReachesSoftplusOrMul(
+    utils::MutableNodeView* start, int target_node_index,
+    bool allow_bf16_noop_cast_forward, const NodeDef* fused_def,
+    const NodeDef* endpoint_dtype_node) {
+  const bool allow_cast = allow_bf16_noop_cast_forward &&
+                          HasDataType(fused_def, DT_BFLOAT16) &&
+                          HasDataType(endpoint_dtype_node, DT_BFLOAT16);
+  utils::MutableNodeView* v = start;
+  for (int h = 0; h < 16 && v != nullptr; ++h) {
+    if (v->node_index() == target_node_index) return true;
+    const NodeDef* nd = v->node();
+    if (nd == nullptr) return false;
+    const auto& outs = v->GetRegularFanout(0);
+    if (outs.size() != 1) return false;
+    utils::MutableNodeView* next = outs[0].node_view();
+    if (nd->op() == "Identity") {
+      v = next;
+      continue;
+    }
+    if (allow_cast && IsCast(*nd)) {
+      DataType st = DT_INVALID, dt = DT_INVALID;
+      if (!GetCastDataTypes(*nd, &st, &dt)) return false;
+      // BF16 no-op cast, or stale Float->BF16 cast on BF16 _FusedMatMul output
+      // (same dtype policy as Mish decomposed removal of
+      // redundant_f32_to_bf16_* casts).
+      if ((st == DT_BFLOAT16 && dt == DT_BFLOAT16) ||
+          (st == DT_FLOAT && dt == DT_BFLOAT16)) {
+        v = next;
+        continue;
+      }
+      return false;
+    }
+    return false;
+  }
+  return false;
+}
+
+bool MishDecomposedVerifyMatmulOutputOnlySoftplusAndMul(
+    utils::MutableNodeView* fused_view, utils::MutableNodeView* sp_view,
+    int mish_mul_node_index, const NodeDef* fused_def, const NodeDef* mul_def) {
+  const auto& direct = fused_view->GetRegularFanout(0);
+  int n_sp = 0;
+  int n_mul = 0;
+  const bool fbf16 = HasDataType(fused_def, DT_BFLOAT16);
+  for (const auto& fo : direct) {
+    utils::MutableNodeView* child = fo.node_view();
+    if (child == nullptr || child->node() == nullptr) {
+      return false;
+    }
+    if (MishDecomposedIsStaleF32ToBf16CastOnBf16MatmulOutput(fused_def,
+                                                             child) &&
+        !MishDecomposedCastHasAnyRegularConsumer(child)) {
+      // Third consumer can be a dead stale Float->BF16 cast on BF16 matmul
+      // output — not part of the Softplus vs Mish Mul fork.
+      continue;
+    }
+    const bool ok_sp = MishDecomposedForwardReachesSoftplusOrMul(
+        child, sp_view->node_index(),
+        fbf16 && HasDataType(sp_view->node(), DT_BFLOAT16), fused_def,
+        sp_view->node());
+    const bool ok_mul = MishDecomposedForwardReachesSoftplusOrMul(
+        child, mish_mul_node_index, fbf16 && HasDataType(mul_def, DT_BFLOAT16),
+        fused_def, mul_def);
+    if (ok_sp == ok_mul) {
+      // A *live* stale Float->BF16 cast (one with real consumers) cannot be
+      // safely folded away: those consumers want the matmul+BiasAdd output, but
+      // after fusion the only surviving node produces Mish(matmul+BiasAdd) -- a
+      // different value -- and the old matmul is deleted, so there is no valid
+      // tensor to rewire them to. Only a *dead* stale cast (handled above) is
+      // tolerable; bail otherwise so the matmul keeps its standalone output.
+      return false;
+    }
+    if (ok_sp) {
+      ++n_sp;
+    } else {
+      ++n_mul;
+    }
+  }
+  if (n_sp != 1 || n_mul != 1) {
+    return false;
+  }
+  return true;
+}
+
+utils::MutableNodeView* SkipIdentityOnly(utils::MutableNodeView* v,
+                                         int max_hops) {
+  for (int h = 0; h < max_hops && v != nullptr; ++h) {
+    NodeDef* nd = v->node();
+    if (nd == nullptr || nd->op() != "Identity") break;
+    if (v->NumRegularFanins() < 1) break;
+    v = v->GetRegularFanin(0).node_view();
+  }
+  return v;
+}
+
+double ReadTensorElemAsDouble(const Tensor& t, int64_t j) {
+  switch (t.dtype()) {
+    case DT_FLOAT:
+      return static_cast<double>(t.flat<float>()(j));
+    case DT_BFLOAT16:
+      return static_cast<double>(
+          static_cast<float>(t.flat<Eigen::bfloat16>()(j)));
+    default:
+      return 0.0;
+  }
+}
+
+bool BuildKerasBnScaleShiftTensors(const Tensor& gamma, const Tensor& beta,
+                                   const Tensor& mean, const Tensor& variance,
+                                   float epsilon, Tensor* scale_dt_float,
+                                   Tensor* shift_dt_float) {
+  const int64_t n = gamma.NumElements();
+  if (beta.NumElements() != n || mean.NumElements() != n ||
+      variance.NumElements() != n) {
+    return false;
+  }
+  Tensor S(DT_FLOAT, {n});
+  Tensor H(DT_FLOAT, {n});
+  for (int64_t j = 0; j < n; ++j) {
+    const double g = ReadTensorElemAsDouble(gamma, j);
+    const double b = ReadTensorElemAsDouble(beta, j);
+    const double m = ReadTensorElemAsDouble(mean, j);
+    const double v = ReadTensorElemAsDouble(variance, j);
+    const double rad = v + static_cast<double>(epsilon);
+    // Use !(rad > 0.0) rather than rad <= 0.0 so that a NaN radicand (e.g. from
+    // a negative/garbage variance entry) is rejected too -- every comparison
+    // with NaN is false, so `rad <= 0.0` would let NaN slip through and get
+    // folded into the weights silently.
+    if (!(rad > 0.0)) return false;
+    const double sigma = std::sqrt(rad);
+    if (!std::isfinite(sigma) || sigma <= 0.0) return false;
+    const double s = g / sigma;
+    const double h = b - m * s;
+    if (!std::isfinite(s) || !std::isfinite(h)) return false;
+    S.flat<float>()(j) = static_cast<float>(s);
+    H.flat<float>()(j) = static_cast<float>(h);
+  }
+  *scale_dt_float = std::move(S);
+  *shift_dt_float = std::move(H);
+  return true;
+}
+
+// Upper bound on a plausible BatchNorm epsilon. Common values are 1e-5..1e-3
+// (Keras default 1e-3); anything notably larger is treated as "not an epsilon".
+constexpr float kMaxBatchNormEpsilon = 0.1f;
+
+// BN folding rewrites the weight/bias Const tensors in place. We stamp this
+// internal marker (attr names starting with '_' are ignored by TF op
+// validation) on a Const once its values have been folded, so a later pass /
+// recheck iteration can never apply the scale/shift a second time.
+constexpr char kZenBnFoldedAttr[] = "_zen_bn_folded";
+
+bool IsConstAlreadyBnFolded(const NodeDef* node) {
+  return node != nullptr && node->attr().contains(kZenBnFoldedAttr);
+}
+
+void MarkConstBnFolded(utils::Mutation* mutation,
+                       utils::MutableNodeView* const_view) {
+  AttrValue marker;
+  marker.set_b(true);
+  mutation->AddOrUpdateNodeAttr(const_view, kZenBnFoldedAttr, marker);
+}
+
+bool ParseVarianceConstFromAddVariancePlusEps(
+    const RemapperContext& ctx, utils::MutableNodeView* add_eps_view,
+    float default_eps, float* epsilon_out, int* variance_const_ix_out) {
+  *epsilon_out = default_eps;
+  *variance_const_ix_out = -1;
+  if (add_eps_view == nullptr || add_eps_view->NumRegularFanins() < 2)
+    return false;
+  bool have_multi_elem_const = false;
+  for (int p = 0; p < 2; ++p) {
+    const auto* fin = add_eps_view->GetRegularFanin(p).node_view();
+    if (fin == nullptr) return false;
+    utils::MutableNodeView* branch = const_cast<utils::MutableNodeView*>(
+        ctx.graph_view.GetNode(fin->node_index()));
+    if (branch == nullptr) return false;
+    branch = SkipIdentityOnly(branch);
+    int const_ix = PeelToConstProducerNodeIndex(ctx, branch);
+    if (const_ix < 0) continue;
+    const NodeDef* cdef = ctx.graph_view.GetNode(const_ix)->node();
+    Tensor t;
+    if (!GetTensorFromConstant(cdef, &t).ok()) continue;
+    if (t.dtype() != DT_FLOAT && t.dtype() != DT_BFLOAT16) continue;
+    if (t.NumElements() == 1) {
+      // The scalar operand of (variance + epsilon) is the epsilon. Identify it
+      // by structure (scalar) rather than by magnitude, but require a sane
+      // finite, non-negative value within the BatchNorm epsilon range. An
+      // out-of-range scalar means this is not a standard var+eps add, so reject
+      // the whole match instead of silently folding with the wrong epsilon.
+      const double eps = ReadTensorElemAsDouble(t, 0);
+      if (!std::isfinite(eps) || eps < 0.0 || eps > kMaxBatchNormEpsilon) {
+        return false;
+      }
+      *epsilon_out = static_cast<float>(eps);
+    } else {
+      // The multi-element operand is the variance: must be finite and
+      // non-negative so that sqrt(var + eps) is real (guards against
+      // NaN/garbage being folded into the weights).
+      const int64_t n = t.NumElements();
+      for (int64_t j = 0; j < n; ++j) {
+        const double v = ReadTensorElemAsDouble(t, j);
+        if (!std::isfinite(v) || v < 0.0) return false;
+      }
+      *variance_const_ix_out = const_ix;
+      have_multi_elem_const = true;
+    }
+  }
+  return have_multi_elem_const && *variance_const_ix_out >= 0;
+}
+
+// Linear decomposed inference BN (e.g. explicit tf.raw_ops after
+// MatMul+BiasAdd):
+//   Add|AddV2( Mul( Mul( Sub(BiasAdd(MatMul), mean), Rsqrt(var+ε) ), gamma ),
+//   beta )
+// Operand order may vary on Add and on each Mul.
+bool FindMatMulBiasKerasBnFoldLinearChain(const RemapperContext& ctx,
+                                          int node_index,
+                                          MatMulBiasKerasBnFoldMatch* matched) {
+  const auto* add_view = ctx.graph_view.GetNode(node_index);
+  const auto* add_def = add_view->node();
+  if (add_def == nullptr || (!IsAdd(*add_def) && add_def->op() != kAddV2)) {
+    return false;
+  }
+  if (HasControlFanin(*add_view) || add_view->NumRegularFanins() != 2) {
+    return false;
+  }
+
+  for (int mul_gamma_port = 0; mul_gamma_port < 2; ++mul_gamma_port) {
+    const utils::MutableNodeView* mul_gamma_view =
+        add_view->GetRegularFanin(mul_gamma_port).node_view();
+    const utils::MutableNodeView* beta_side_view =
+        add_view->GetRegularFanin(1 - mul_gamma_port).node_view();
+    if (mul_gamma_view == nullptr || beta_side_view == nullptr) {
+      continue;
+    }
+    const NodeDef* mul_gamma_def = mul_gamma_view->node();
+    if (mul_gamma_def == nullptr || !IsAnyMul(*mul_gamma_def)) {
+      continue;
+    }
+    if (HasControlFanin(*mul_gamma_view) ||
+        mul_gamma_view->NumRegularFanins() != 2 ||
+        IsInPreserveSet(ctx, mul_gamma_def) ||
+        !HasAtMostOneFanoutAtPort0(*mul_gamma_view)) {
+      continue;
+    }
+
+    utils::MutableNodeView* beta_mut = const_cast<utils::MutableNodeView*>(
+        ctx.graph_view.GetNode(beta_side_view->node_index()));
+    beta_mut = SkipIdentityOnly(beta_mut);
+    int beta_ix = PeelToConstProducerNodeIndex(ctx, beta_mut);
+    if (beta_ix < 0) {
+      continue;
+    }
+    Tensor Beta;
+    if (!GetTensorFromConstant(ctx.graph_view.GetNode(beta_ix)->node(), &Beta)
+             .ok()) {
+      continue;
+    }
+
+    const utils::MutableNodeView* inner_mul_view = nullptr;
+    int gamma_ix = kMissingIndex;
+    for (int gp = 0; gp < 2; ++gp) {
+      const auto* branch_mul = mul_gamma_view->GetRegularFanin(gp).node_view();
+      const auto* branch_other =
+          mul_gamma_view->GetRegularFanin(1 - gp).node_view();
+      if (branch_mul == nullptr || branch_other == nullptr) {
+        continue;
+      }
+      const NodeDef* bm_def = branch_mul->node();
+      if (bm_def == nullptr || !IsAnyMul(*bm_def)) {
+        continue;
+      }
+      utils::MutableNodeView* gamma_peel = const_cast<utils::MutableNodeView*>(
+          ctx.graph_view.GetNode(branch_other->node_index()));
+      gamma_peel = SkipIdentityOnly(gamma_peel);
+      int g_ix = PeelToConstProducerNodeIndex(ctx, gamma_peel);
+      if (g_ix < 0) {
+        continue;
+      }
+      Tensor Gamma_probe;
+      if (!GetTensorFromConstant(ctx.graph_view.GetNode(g_ix)->node(),
+                                 &Gamma_probe)
+               .ok()) {
+        continue;
+      }
+      inner_mul_view = branch_mul;
+      gamma_ix = g_ix;
+      break;
+    }
+    if (inner_mul_view == nullptr || gamma_ix == kMissingIndex) {
+      continue;
+    }
+    const NodeDef* inner_mul_def = inner_mul_view->node();
+    if (HasControlFanin(*inner_mul_view) ||
+        inner_mul_view->NumRegularFanins() != 2 ||
+        IsInPreserveSet(ctx, inner_mul_def) ||
+        !HasAtMostOneFanoutAtPort0(*inner_mul_view)) {
+      continue;
+    }
+
+    const utils::MutableNodeView* sub_view = nullptr;
+    const utils::MutableNodeView* rsqrt_view = nullptr;
+    for (int ip = 0; ip < 2; ++ip) {
+      const auto* a = inner_mul_view->GetRegularFanin(ip).node_view();
+      const auto* b = inner_mul_view->GetRegularFanin(1 - ip).node_view();
+      if (a == nullptr || b == nullptr) {
+        continue;
+      }
+      const NodeDef* ad = a->node();
+      const NodeDef* bd = b->node();
+      if (ad == nullptr || bd == nullptr) {
+        continue;
+      }
+      if (IsSub(*ad) && IsRsqrt(*bd)) {
+        sub_view = a;
+        rsqrt_view = b;
+        break;
+      }
+      if (IsSub(*bd) && IsRsqrt(*ad)) {
+        sub_view = b;
+        rsqrt_view = a;
+        break;
+      }
+    }
+    if (sub_view == nullptr || rsqrt_view == nullptr) {
+      continue;
+    }
+    const NodeDef* sub_def = sub_view->node();
+    const NodeDef* rsqrt_def = rsqrt_view->node();
+    if (HasControlFanin(*sub_view) || sub_view->NumRegularFanins() != 2 ||
+        IsInPreserveSet(ctx, sub_def) ||
+        !HasAtMostOneFanoutAtPort0(*sub_view)) {
+      continue;
+    }
+    if (HasControlFanin(*rsqrt_view) || rsqrt_view->NumRegularFanins() != 1 ||
+        IsInPreserveSet(ctx, rsqrt_def) ||
+        !HasAtMostOneFanoutAtPort0(*rsqrt_view)) {
+      continue;
+    }
+
+    // Sub(linear, mean): fanin 0 is the MatMul+BiasAdd chain (optional Cast).
+    const utils::MutableNodeView* linear_side =
+        sub_view->GetRegularFanin(0).node_view();
+    const utils::MutableNodeView* mean_side =
+        sub_view->GetRegularFanin(1).node_view();
+    if (linear_side == nullptr || mean_side == nullptr) {
+      continue;
+    }
+
+    const utils::MutableNodeView* bias_cast_view = nullptr;
+    utils::MutableNodeView* bias_add_mut = nullptr;
+    utils::MutableNodeView* linear_head = const_cast<utils::MutableNodeView*>(
+        ctx.graph_view.GetNode(linear_side->node_index()));
+    linear_head = SkipIdentityOnly(linear_head);
+    if (linear_head == nullptr) {
+      continue;
+    }
+    NodeDef* lh_def = linear_head->node();
+    if (lh_def != nullptr && lh_def->op() == kCast) {
+      if (HasControlFanin(*linear_head) ||
+          linear_head->NumRegularFanins() < 1 || IsInPreserveSet(ctx, lh_def) ||
+          !HasAtMostOneFanoutAtPort0(*linear_head)) {
+        continue;
+      }
+      bias_cast_view = linear_head;
+      linear_head = linear_head->GetRegularFanin(0).node_view();
+      lh_def = linear_head != nullptr ? linear_head->node() : nullptr;
+    }
+    int bias_port = 1;
+    if (linear_head == nullptr || lh_def == nullptr ||
+        (!IsBiasAdd(*lh_def) &&
+         !IsBiasSemanticAdd(ctx, *linear_head, &bias_port))) {
+      continue;
+    }
+    if (HasControlFanin(*linear_head) || linear_head->NumRegularFanins() != 2 ||
+        IsInPreserveSet(ctx, lh_def) ||
+        !HasAtMostOneFanoutAtPort0(*linear_head)) {
+      continue;
+    }
+    bias_add_mut = linear_head;
+    const auto* matmul_view =
+        bias_add_mut->GetRegularFanin(1 - bias_port).node_view();
+    const NodeDef* matmul_def =
+        matmul_view != nullptr ? matmul_view->node() : nullptr;
+    if (matmul_view == nullptr || matmul_def == nullptr) {
+      continue;
+    }
+    if (!IsMatMulZenOrBatchMatMul(*matmul_def)) {
+      continue;
+    }
+    if (!MatMulLikeNoTransposeOrAdj(*matmul_def)) {
+      continue;
+    }
+    if (!MatMulFoldRankOk(ctx, *matmul_def)) {
+      continue;
+    }
+    if (!NodeIsOnCpu(matmul_def)) {
+      continue;
+    }
+    if (HasControlFanin(*matmul_view) ||
+        !HasAtMostOneFanoutAtPort0(*matmul_view) ||
+        IsInPreserveSet(ctx, matmul_def)) {
+      continue;
+    }
+    if (HasDataType(matmul_def, DT_DOUBLE)) {
+      continue;
+    }
+
+    utils::MutableNodeView* mean_mut = const_cast<utils::MutableNodeView*>(
+        ctx.graph_view.GetNode(mean_side->node_index()));
+    mean_mut = SkipIdentityOnly(mean_mut);
+    int mean_ix = PeelToConstProducerNodeIndex(ctx, mean_mut);
+    if (mean_ix < 0) {
+      continue;
+    }
+    Tensor Mean;
+    if (!GetTensorFromConstant(ctx.graph_view.GetNode(mean_ix)->node(), &Mean)
+             .ok()) {
+      continue;
+    }
+
+    const auto* rsqrt_in = rsqrt_view->GetRegularFanin(0).node_view();
+    if (rsqrt_in == nullptr) {
+      continue;
+    }
+    utils::MutableNodeView* add_eps_mut = const_cast<utils::MutableNodeView*>(
+        ctx.graph_view.GetNode(rsqrt_in->node_index()));
+    if (add_eps_mut == nullptr) {
+      continue;
+    }
+    add_eps_mut = SkipIdentityOnly(add_eps_mut);
+    NodeDef* add_eps_def = add_eps_mut->node();
+    if (add_eps_def == nullptr ||
+        (add_eps_def->op() != kAddV2 && !IsAdd(*add_eps_def))) {
+      continue;
+    }
+    if (HasControlFanin(*add_eps_mut) || add_eps_mut->NumRegularFanins() != 2 ||
+        IsInPreserveSet(ctx, add_eps_def) ||
+        !HasAtMostOneFanoutAtPort0(*add_eps_mut)) {
+      continue;
+    }
+
+    float epsilon = 1e-3f;
+    int var_const_ix = kMissingIndex;
+    if (!ParseVarianceConstFromAddVariancePlusEps(ctx, add_eps_mut, 1e-3f,
+                                                  &epsilon, &var_const_ix)) {
+      continue;
+    }
+
+    Tensor Gamma;
+    if (!GetTensorFromConstant(ctx.graph_view.GetNode(gamma_ix)->node(), &Gamma)
+             .ok()) {
+      continue;
+    }
+    const NodeDef* var_def = ctx.graph_view.GetNode(var_const_ix)->node();
+    Tensor Variance;
+    if (!GetTensorFromConstant(var_def, &Variance).ok()) {
+      continue;
+    }
+
+    DataType t_mm = GetDataTypeFromAttr(*matmul_def, "T");
+    DataType t_inner = GetDataTypeFromAttr(*inner_mul_def, "T");
+    if (bias_cast_view != nullptr) {
+      DataType c_src = DT_INVALID, c_dst = DT_INVALID;
+      if (!GetCastDataTypes(*(bias_cast_view->node()), &c_src, &c_dst)) {
+        continue;
+      }
+      if (c_src != t_mm || c_dst != t_inner) {
+        continue;
+      }
+      if (!HaveSameDataType(add_def, mul_gamma_def)) {
+        continue;
+      }
+    } else {
+      if (!HaveSameDataType(add_def, matmul_def)) {
+        continue;
+      }
+      if (!HaveSameDataType(inner_mul_def, matmul_def)) {
+        continue;
+      }
+    }
+
+    utils::MutableNodeView* w_mutable = const_cast<utils::MutableNodeView*>(
+        ctx.graph_view.GetNode(ParseTensorName(matmul_def->input(1)).node()));
+    utils::MutableNodeView* b_mutable =
+        const_cast<utils::MutableNodeView*>(ctx.graph_view.GetNode(
+            ParseTensorName(bias_add_mut->node()->input(bias_port)).node()));
+    if (w_mutable == nullptr || b_mutable == nullptr) {
+      continue;
+    }
+    int w_ix = PeelToConstProducerNodeIndex(ctx, w_mutable);
+    int b_ix = PeelToConstProducerNodeIndex(ctx, b_mutable);
+    if (w_ix < 0 || b_ix < 0) {
+      continue;
+    }
+    if (IsConstAlreadyBnFolded(ctx.graph_view.GetNode(w_ix)->node()) ||
+        IsConstAlreadyBnFolded(ctx.graph_view.GetNode(b_ix)->node())) {
+      continue;
+    }
+
+    Tensor W;
+    Tensor B;
+    if (!GetTensorFromConstant(ctx.graph_view.GetNode(w_ix)->node(), &W).ok() ||
+        !GetTensorFromConstant(ctx.graph_view.GetNode(b_ix)->node(), &B).ok()) {
+      continue;
+    }
+
+    Tensor Sfloat;
+    Tensor Hfloat;
+    if (!BuildKerasBnScaleShiftTensors(Gamma, Beta, Mean, Variance, epsilon,
+                                       &Sfloat, &Hfloat)) {
+      continue;
+    }
+    if (!FuseMatmulBNfoldTensorShapesOk(W, B, Sfloat, Hfloat, t_mm)) {
+      continue;
+    }
+
+    int tail_cast_ix = kMissingIndex;
+    const auto& keras_add_fanouts = add_view->GetRegularFanout(0);
+    if (keras_add_fanouts.size() == 1) {
+      const auto* tail_view = keras_add_fanouts[0].node_view();
+      const NodeDef* tail_def =
+          tail_view != nullptr ? tail_view->node() : nullptr;
+      if (tail_view != nullptr && tail_def != nullptr && IsCast(*tail_def) &&
+          !HasControlFanin(*tail_view)) {
+        DataType tc_src = DT_INVALID, tc_dst = DT_INVALID;
+        if (GetCastDataTypes(*tail_def, &tc_src, &tc_dst) &&
+            tc_src == GetDataTypeFromAttr(*add_def, "T") && tc_dst == t_mm) {
+          tail_cast_ix = tail_view->node_index();
+        }
+      }
+    }
+
+    matched->matmul = matmul_view->node_index();
+    matched->bias_add = bias_add_mut->node_index();
+    matched->mul_1 = mul_gamma_view->node_index();
+    matched->keras_bn_add = node_index;
+    matched->sub = sub_view->node_index();
+    matched->mul_scale = inner_mul_view->node_index();
+    matched->mul_mean = kMissingIndex;
+    matched->rsqrt = rsqrt_view->node_index();
+    matched->add_eps = add_eps_mut->node_index();
+    matched->gamma_const = gamma_ix;
+    matched->beta_const = beta_ix;
+    matched->mean_const = mean_ix;
+    matched->variance_const = var_const_ix;
+    matched->epsilon = epsilon;
+    matched->bias_port = bias_port;
+    matched->bias_cast = bias_cast_view != nullptr
+                             ? bias_cast_view->node_index()
+                             : kMissingIndex;
+    matched->tail_cast = tail_cast_ix;
+    return true;
+  }
+  return false;
+}
+
+bool FindMatMulBiasKerasBnFold(const RemapperContext& ctx, int node_index,
+                               MatMulBiasKerasBnFoldMatch* matched) {
+  if (FindMatMulBiasKerasBnFoldLinearChain(ctx, node_index, matched)) {
+    return true;
+  }
+  const auto* add_view = ctx.graph_view.GetNode(node_index);
+  const auto* add_def = add_view->node();
+  if (add_def == nullptr || (!IsAdd(*add_def) && add_def->op() != kAddV2)) {
+    return false;
+  }
+  if (HasControlFanin(*add_view) || add_view->NumRegularFanins() != 2) {
+    return false;
+  }
+
+  const auto* in0 = add_view->GetRegularFanin(0).node_view();
+  const auto* in1 = add_view->GetRegularFanin(1).node_view();
+  if (in0 == nullptr || in1 == nullptr) return false;
+  const NodeDef* d0 = in0->node();
+  const NodeDef* d1 = in1->node();
+  if (d0 == nullptr || d1 == nullptr) return false;
+
+  const utils::MutableNodeView *mul_1_view = nullptr, *sub_view = nullptr;
+  if (IsAnyMul(*d0) && IsSub(*d1)) {
+    mul_1_view = in0;
+    sub_view = in1;
+  } else if (IsAnyMul(*d1) && IsSub(*d0)) {
+    mul_1_view = in1;
+    sub_view = in0;
+  } else {
+    return false;
+  }
+
+  const NodeDef* mul_1_def = mul_1_view->node();
+  const NodeDef* sub_def = sub_view->node();
+  if (HasControlFanin(*mul_1_view) || mul_1_view->NumRegularFanins() != 2 ||
+      IsInPreserveSet(ctx, mul_1_def) ||
+      !HasAtMostOneFanoutAtPort0(*mul_1_view)) {
+    return false;
+  }
+  if (HasControlFanin(*sub_view) || sub_view->NumRegularFanins() != 2 ||
+      IsInPreserveSet(ctx, sub_def)) {
+    return false;
+  }
+
+  const utils::MutableNodeView* bias_cast_view = nullptr;
+  utils::MutableNodeView* bias_add_mut = nullptr;
+
+  auto resolve_mul1_bias_side =
+      [&](const utils::MutableNodeView* chain_a,
+          const utils::MutableNodeView* chain_b) -> bool {
+    for (int chain_port = 0; chain_port < 2; ++chain_port) {
+      const utils::MutableNodeView* chain =
+          (chain_port == 0 ? chain_a : chain_b);
+      const utils::MutableNodeView* other =
+          (chain_port == 0 ? chain_b : chain_a);
+      if (chain == nullptr || other == nullptr) {
+        continue;
+      }
+      const NodeDef* od = other->node();
+      if (od == nullptr || !IsAnyMul(*od)) {
+        continue;
+      }
+      utils::MutableNodeView* head = const_cast<utils::MutableNodeView*>(
+          ctx.graph_view.GetNode(chain->node_index()));
+      head = SkipIdentityOnly(head);
+      if (head == nullptr) {
+        continue;
+      }
+      NodeDef* hd = head->node();
+      if (hd == nullptr) {
+        continue;
+      }
+      if (hd->op() == kCast) {
+        if (HasControlFanin(*head) || head->NumRegularFanins() < 1 ||
+            IsInPreserveSet(ctx, hd) || !HasAtMostOneFanoutAtPort0(*head)) {
+          continue;
+        }
+        bias_cast_view = head;
+        head = head->GetRegularFanin(0).node_view();
+        hd = head != nullptr ? head->node() : nullptr;
+      }
+      int port_temp = 1;
+      if (head == nullptr || hd == nullptr ||
+          (!IsBiasAdd(*hd) && !IsBiasSemanticAdd(ctx, *head, &port_temp))) {
+        continue;
+      }
+      if (HasControlFanin(*head) || head->NumRegularFanins() != 2 ||
+          IsInPreserveSet(ctx, hd) || !HasAtMostOneFanoutAtPort0(*head)) {
+        continue;
+      }
+      bias_add_mut = head;
+      return true;
+    }
+    return false;
+  };
+
+  if (!resolve_mul1_bias_side(mul_1_view->GetRegularFanin(0).node_view(),
+                              mul_1_view->GetRegularFanin(1).node_view())) {
+    return false;
+  }
+
+  DCHECK(bias_add_mut != nullptr);
+  const NodeDef* bias_add_def = bias_add_mut->node();
+  int bias_port = 1;
+  const auto& contraction_fanin = bias_add_mut->GetRegularFanin(1 - bias_port);
+  const auto* matmul_view = contraction_fanin.node_view();
+  const auto* matmul_def =
+      matmul_view != nullptr ? matmul_view->node() : nullptr;
+  if (matmul_view == nullptr || matmul_def == nullptr) {
+    return false;
+  }
+  if (!IsMatMulZenOrBatchMatMul(*matmul_def)) {
+    return false;
+  }
+  if (!MatMulLikeNoTransposeOrAdj(*matmul_def)) {
+    return false;
+  }
+  if (!MatMulFoldRankOk(ctx, *matmul_def)) {
+    return false;
+  }
+  if (!NodeIsOnCpu(matmul_def)) {
+    return false;
+  }
+  if (HasControlFanin(*matmul_view) ||
+      !HasAtMostOneFanoutAtPort0(*matmul_view) ||
+      IsInPreserveSet(ctx, matmul_def)) {
+    return false;
+  }
+  if (HasDataType(matmul_def, DT_DOUBLE)) {
+    return false;
+  }
+
+  const utils::MutableNodeView* mul_scale_view = nullptr;
+  for (int p = 0; p < 2; ++p) {
+    const auto* cand = mul_1_view->GetRegularFanin(p).node_view();
+    if (cand != nullptr && cand->node_index() != bias_add_mut->node_index() &&
+        (bias_cast_view == nullptr ||
+         cand->node_index() != bias_cast_view->node_index())) {
+      mul_scale_view = cand;
+      break;
+    }
+  }
+  if (mul_scale_view == nullptr) {
+    return false;
+  }
+  const NodeDef* mul_scale_def = mul_scale_view->node();
+  if (!IsAnyMul(*mul_scale_def) || HasControlFanin(*mul_scale_view) ||
+      mul_scale_view->NumRegularFanins() != 2 ||
+      IsInPreserveSet(ctx, mul_scale_def)) {
+    return false;
+  }
+  const auto& mul_scale_fanouts = mul_scale_view->GetRegularFanout(0);
+  if (mul_scale_fanouts.size() != 2) {
+    return false;
+  }
+
+  const utils::MutableNodeView* rsqrt_view = nullptr;
+  const utils::MutableNodeView* gamma_branch = nullptr;
+  for (int p = 0; p < 2; ++p) {
+    const auto* cand = mul_scale_view->GetRegularFanin(p).node_view();
+    if (cand == nullptr) {
+      return false;
+    }
+    const NodeDef* cd = cand->node();
+    if (cd != nullptr && IsRsqrt(*cd)) {
+      rsqrt_view = cand;
+    } else {
+      gamma_branch = cand;
+    }
+  }
+  if (rsqrt_view == nullptr || gamma_branch == nullptr) {
+    return false;
+  }
+  const NodeDef* rsqrt_def = rsqrt_view->node();
+  if (HasControlFanin(*rsqrt_view) || rsqrt_view->NumRegularFanins() != 1 ||
+      IsInPreserveSet(ctx, rsqrt_def) ||
+      !HasAtMostOneFanoutAtPort0(*rsqrt_view)) {
+    return false;
+  }
+
+  utils::MutableNodeView* add_eps_mut =
+      const_cast<utils::MutableNodeView*>(ctx.graph_view.GetNode(
+          rsqrt_view->GetRegularFanin(0).node_view()->node_index()));
+  if (add_eps_mut == nullptr) {
+    return false;
+  }
+  add_eps_mut = SkipIdentityOnly(add_eps_mut);
+  NodeDef* add_eps_def = add_eps_mut->node();
+  if (add_eps_def == nullptr ||
+      (add_eps_def->op() != kAddV2 && !IsAdd(*add_eps_def))) {
+    return false;
+  }
+  if (HasControlFanin(*add_eps_mut) || add_eps_mut->NumRegularFanins() != 2 ||
+      IsInPreserveSet(ctx, add_eps_def) ||
+      !HasAtMostOneFanoutAtPort0(*add_eps_mut)) {
+    return false;
+  }
+
+  float epsilon = 1e-3f;
+  int var_const_ix = -1;
+  if (!ParseVarianceConstFromAddVariancePlusEps(ctx, add_eps_mut, 1e-3f,
+                                                &epsilon, &var_const_ix)) {
+    return false;
+  }
+
+  utils::MutableNodeView* gamma_mut = const_cast<utils::MutableNodeView*>(
+      ctx.graph_view.GetNode(gamma_branch->node_index()));
+  int gamma_ix = PeelToConstProducerNodeIndex(ctx, gamma_mut);
+  if (gamma_ix < 0) {
+    return false;
+  }
+  const NodeDef* gamma_def = ctx.graph_view.GetNode(gamma_ix)->node();
+  Tensor Gamma;
+  if (!GetTensorFromConstant(gamma_def, &Gamma).ok()) {
+    return false;
+  }
+
+  const NodeDef* var_def = ctx.graph_view.GetNode(var_const_ix)->node();
+  Tensor Variance;
+  if (!GetTensorFromConstant(var_def, &Variance).ok()) {
+    return false;
+  }
+
+  const utils::MutableNodeView* mul_mean_view = nullptr;
+  for (int p = 0; p < 2; ++p) {
+    const auto* cand = sub_view->GetRegularFanin(p).node_view();
+    if (cand == nullptr) {
+      return false;
+    }
+    if (IsAnyMul(*(cand->node()))) {
+      mul_mean_view = cand;
+      break;
+    }
+  }
+  if (mul_mean_view == nullptr) {
+    return false;
+  }
+  const NodeDef* mul_mean_def = mul_mean_view->node();
+  if (!IsAnyMul(*mul_mean_def) || HasControlFanin(*mul_mean_view) ||
+      mul_mean_view->NumRegularFanins() != 2 ||
+      IsInPreserveSet(ctx, mul_mean_def)) {
+    return false;
+  }
+
+  bool shares_scale = false;
+  for (int p = 0; p < 2; ++p) {
+    const auto* x = mul_mean_view->GetRegularFanin(p).node_view();
+    if (x != nullptr && x->node_index() == mul_scale_view->node_index()) {
+      shares_scale = true;
+      break;
+    }
+  }
+  if (!shares_scale) {
+    return false;
+  }
+
+  utils::MutableNodeView* mean_mut = nullptr;
+  for (int p = 0; p < 2; ++p) {
+    const auto* x = mul_mean_view->GetRegularFanin(p).node_view();
+    if (x != nullptr && x->node_index() != mul_scale_view->node_index()) {
+      mean_mut = const_cast<utils::MutableNodeView*>(
+          ctx.graph_view.GetNode(x->node_index()));
+      break;
+    }
+  }
+  if (mean_mut == nullptr) {
+    return false;
+  }
+  mean_mut = SkipIdentityOnly(mean_mut);
+  int mean_ix = PeelToConstProducerNodeIndex(ctx, mean_mut);
+  if (mean_ix < 0) {
+    return false;
+  }
+  Tensor Mean;
+  if (!GetTensorFromConstant(ctx.graph_view.GetNode(mean_ix)->node(), &Mean)
+           .ok()) {
+    return false;
+  }
+
+  utils::MutableNodeView* beta_mut = nullptr;
+  for (int p = 0; p < 2; ++p) {
+    const auto* x = sub_view->GetRegularFanin(p).node_view();
+    if (x != nullptr && x->node_index() != mul_mean_view->node_index()) {
+      beta_mut = const_cast<utils::MutableNodeView*>(
+          ctx.graph_view.GetNode(x->node_index()));
+      break;
+    }
+  }
+  if (beta_mut == nullptr) {
+    return false;
+  }
+  beta_mut = SkipIdentityOnly(beta_mut);
+  int beta_ix = PeelToConstProducerNodeIndex(ctx, beta_mut);
+  if (beta_ix < 0) {
+    return false;
+  }
+  Tensor Beta;
+  if (!GetTensorFromConstant(ctx.graph_view.GetNode(beta_ix)->node(), &Beta)
+           .ok()) {
+    return false;
+  }
+
+  DataType t_mm = GetDataTypeFromAttr(*matmul_def, "T");
+  DataType t_mul = GetDataTypeFromAttr(*mul_1_def, "T");
+  if (bias_cast_view != nullptr) {
+    DataType c_src = DT_INVALID, c_dst = DT_INVALID;
+    if (!GetCastDataTypes(*(bias_cast_view->node()), &c_src, &c_dst)) {
+      return false;
+    }
+    if (c_src != t_mm || c_dst != t_mul) {
+      return false;
+    }
+    if (!HaveSameDataType(add_def, mul_1_def)) {
+      return false;
+    }
+  } else {
+    if (!HaveSameDataType(add_def, matmul_def)) {
+      return false;
+    }
+    if (!HaveSameDataType(mul_1_def, matmul_def)) {
+      return false;
+    }
+  }
+
+  utils::MutableNodeView* w_mutable = const_cast<utils::MutableNodeView*>(
+      ctx.graph_view.GetNode(ParseTensorName(matmul_def->input(1)).node()));
+  utils::MutableNodeView* b_mutable =
+      const_cast<utils::MutableNodeView*>(ctx.graph_view.GetNode(
+          ParseTensorName(bias_add_def->input(bias_port)).node()));
+  if (w_mutable == nullptr || b_mutable == nullptr) {
+    return false;
+  }
+  int w_ix = PeelToConstProducerNodeIndex(ctx, w_mutable);
+  int b_ix = PeelToConstProducerNodeIndex(ctx, b_mutable);
+  if (w_ix < 0 || b_ix < 0) {
+    return false;
+  }
+  if (IsConstAlreadyBnFolded(ctx.graph_view.GetNode(w_ix)->node()) ||
+      IsConstAlreadyBnFolded(ctx.graph_view.GetNode(b_ix)->node())) {
+    return false;
+  }
+
+  Tensor W;
+  Tensor B;
+  if (!GetTensorFromConstant(ctx.graph_view.GetNode(w_ix)->node(), &W).ok() ||
+      !GetTensorFromConstant(ctx.graph_view.GetNode(b_ix)->node(), &B).ok()) {
+    return false;
+  }
+
+  Tensor Sfloat;
+  Tensor Hfloat;
+  if (!BuildKerasBnScaleShiftTensors(Gamma, Beta, Mean, Variance, epsilon,
+                                     &Sfloat, &Hfloat)) {
+    return false;
+  }
+  if (!FuseMatmulBNfoldTensorShapesOk(W, B, Sfloat, Hfloat, t_mm)) {
+    return false;
+  }
+
+  int tail_cast_ix = kMissingIndex;
+  const auto& keras_add_fanouts = add_view->GetRegularFanout(0);
+  if (keras_add_fanouts.size() == 1) {
+    const auto* tail_view = keras_add_fanouts[0].node_view();
+    const NodeDef* tail_def =
+        tail_view != nullptr ? tail_view->node() : nullptr;
+    if (tail_view != nullptr && tail_def != nullptr && IsCast(*tail_def) &&
+        !HasControlFanin(*tail_view)) {
+      DataType tc_src = DT_INVALID, tc_dst = DT_INVALID;
+      if (GetCastDataTypes(*tail_def, &tc_src, &tc_dst) &&
+          tc_src == GetDataTypeFromAttr(*add_def, "T") && tc_dst == t_mm) {
+        tail_cast_ix = tail_view->node_index();
+      }
+    }
+  }
+
+  matched->matmul = matmul_view->node_index();
+  matched->bias_add = bias_add_mut->node_index();
+  matched->mul_1 = mul_1_view->node_index();
+  matched->keras_bn_add = node_index;
+  matched->sub = sub_view->node_index();
+  matched->mul_scale = mul_scale_view->node_index();
+  matched->mul_mean = mul_mean_view->node_index();
+  matched->rsqrt = rsqrt_view->node_index();
+  matched->add_eps = add_eps_mut->node_index();
+  matched->gamma_const = gamma_ix;
+  matched->beta_const = beta_ix;
+  matched->mean_const = mean_ix;
+  matched->variance_const = var_const_ix;
+  matched->epsilon = epsilon;
+  matched->bias_port = bias_port;
+  matched->bias_cast =
+      bias_cast_view != nullptr ? bias_cast_view->node_index() : kMissingIndex;
+  matched->tail_cast = tail_cast_ix;
+  return true;
+}
+
+Status AddMatMulBiasKerasBnFold(RemapperContext* ctx,
+                                const MatMulBiasKerasBnFoldMatch& matched,
+                                std::vector<bool>* invalidated_nodes,
+                                std::vector<bool>* nodes_to_delete) {
+  const GraphDef* graph = ctx->graph_view.graph();
+  const NodeDef& matmul = graph->node(matched.matmul);
+  const NodeDef& bias_add = graph->node(matched.bias_add);
+  const NodeDef& keras_add = graph->node(matched.keras_bn_add);
+
+  if (matched.gamma_const < 0 || matched.beta_const < 0 ||
+      matched.mean_const < 0 || matched.variance_const < 0) {
+    return errors::Internal("MatMulBiasKerasBnFold: missing const indices");
+  }
+
+  Tensor Gamma, Beta, Mean, Variance;
+  TF_RETURN_IF_ERROR(GetTensorFromConstant(
+      ctx->graph_view.GetNode(matched.gamma_const)->node(), &Gamma));
+  TF_RETURN_IF_ERROR(GetTensorFromConstant(
+      ctx->graph_view.GetNode(matched.beta_const)->node(), &Beta));
+  TF_RETURN_IF_ERROR(GetTensorFromConstant(
+      ctx->graph_view.GetNode(matched.mean_const)->node(), &Mean));
+  TF_RETURN_IF_ERROR(GetTensorFromConstant(
+      ctx->graph_view.GetNode(matched.variance_const)->node(), &Variance));
+
+  utils::MutableNodeView* w_mutable =
+      ctx->graph_view.GetNode(ParseTensorName(matmul.input(1)).node());
+  utils::MutableNodeView* b_mutable = ctx->graph_view.GetNode(
+      ParseTensorName(bias_add.input(matched.bias_port)).node());
+  int w_ix = PeelToConstProducerNodeIndex(*ctx, w_mutable);
+  int b_ix = PeelToConstProducerNodeIndex(*ctx, b_mutable);
+  if (w_ix < 0 || b_ix < 0) {
+    return errors::Internal("MatMulBiasKerasBnFold: weight/bias const peel");
+  }
+  auto* w_view = ctx->graph_view.GetNode(w_ix);
+  auto* b_view = ctx->graph_view.GetNode(b_ix);
+  NodeDef* w_def = w_view->node();
+  NodeDef* b_def = b_view->node();
+
+  Tensor W;
+  Tensor B;
+  TF_RETURN_IF_ERROR(GetTensorFromConstant(w_def, &W));
+  TF_RETURN_IF_ERROR(GetTensorFromConstant(b_def, &B));
+
+  Tensor Sfloat;
+  Tensor Hfloat;
+  if (!BuildKerasBnScaleShiftTensors(Gamma, Beta, Mean, Variance,
+                                     matched.epsilon, &Sfloat, &Hfloat)) {
+    return errors::Internal("MatMulBiasKerasBnFold: scale/shift build failed");
+  }
+
+  DataType t = GetDataTypeFromAttr(matmul, "T");
+  if (!FuseMatmulBNfoldTensorShapesOk(W, B, Sfloat, Hfloat, t)) {
+    return errors::Internal("MatMulBiasKerasBnFold: tensor shapes");
+  }
+  ApplyFuseMatmulBNfoldToTensors(&W, &B, Sfloat, Hfloat, t);
+
+  AttrValue w_attr;
+  AttrValue b_attr;
+  W.AsProtoTensorContent(w_attr.mutable_tensor());
+  B.AsProtoTensorContent(b_attr.mutable_tensor());
+
+  NodeDef fused_node;
+  fused_node.set_op(kFusedMatMul);
+  fused_node.set_name(keras_add.name());
+  fused_node.set_device(matmul.device());
+  fused_node.add_input(matmul.input(0));
+  fused_node.add_input(matmul.input(1));
+  fused_node.add_input(bias_add.input(matched.bias_port));
+  CopyMatMulLikeAttributes(matmul, &fused_node);
+  SetFusedOpAttributes(&fused_node, {"BiasAdd"});
+
+  zendnnl::error_handling::apilog_info("Remapper: Fusing ", matmul.op(), " (",
+                                       matmul.name(), ") with Keras BN fold");
+
+  utils::Mutation* mutation = ctx->graph_view.GetMutationBuilder();
+  Status status;
+  mutation->AddOrUpdateNodeAttr(w_view, "value", w_attr);
+  mutation->AddOrUpdateNodeAttr(b_view, "value", b_attr);
+  // Tag the rewritten Consts so a later pass/recheck cannot fold them twice.
+  MarkConstBnFolded(mutation, w_view);
+  MarkConstBnFolded(mutation, b_view);
+  mutation->AddNode(std::move(fused_node), &status);
+  TF_RETURN_IF_ERROR(status);
+  TF_RETURN_IF_ERROR(mutation->Apply());
+
+  const string& fused_out_name =
+      ctx->graph_view.graph()->node(matched.keras_bn_add).name();
+  if (matched.tail_cast != kMissingIndex) {
+    utils::MutableNodeView* tail_cast_view =
+        ctx->graph_view.GetNode(matched.tail_cast);
+    if (tail_cast_view == nullptr) {
+      return errors::Internal("MatMulBiasKerasBnFold: tail Cast not found");
+    }
+    utils::Mutation* tail_mut = ctx->graph_view.GetMutationBuilder();
+    SafeTensorId safe_fused_out(fused_out_name, 0);
+    const TensorId fused_tid(safe_fused_out);
+    for (const auto& fo_set : tail_cast_view->GetRegularFanouts()) {
+      for (const auto& fo : fo_set) {
+        tail_mut->AddOrUpdateRegularFanin(fo.node_view(), fo.index(),
+                                          fused_tid);
+      }
+    }
+    for (const auto& ctrl : tail_cast_view->GetControlledFanouts()) {
+      tail_mut->RemoveControllingFanin(ctrl.node_view(),
+                                       tail_cast_view->node()->name());
+      tail_mut->AddControllingFanin(ctrl.node_view(), fused_out_name);
+    }
+    TF_RETURN_IF_ERROR(tail_mut->Apply());
+    (*nodes_to_delete)[matched.tail_cast] = true;
+  }
+
+  (*invalidated_nodes)[matched.keras_bn_add] = true;
+  (*nodes_to_delete)[matched.matmul] = true;
+  (*nodes_to_delete)[matched.bias_add] = true;
+  (*nodes_to_delete)[matched.mul_1] = true;
+  (*nodes_to_delete)[matched.sub] = true;
+  (*nodes_to_delete)[matched.mul_scale] = true;
+  if (matched.mul_mean != kMissingIndex) {
+    (*nodes_to_delete)[matched.mul_mean] = true;
+  }
+  (*nodes_to_delete)[matched.rsqrt] = true;
+  (*nodes_to_delete)[matched.add_eps] = true;
+  if (matched.bias_cast != kMissingIndex) {
+    (*nodes_to_delete)[matched.bias_cast] = true;
+  }
+
+  return OkStatus();
+}
+
+bool FindMatMulBiasMulAddFold(const RemapperContext& ctx, int node_index,
+                              MatMulBiasMulAddFoldMatch* matched) {
+  const auto* add_view = ctx.graph_view.GetNode(node_index);
+  const auto* add_def = add_view->node();
+  if (add_def == nullptr || (!IsAdd(*add_def) && add_def->op() != kAddV2)) {
+    return false;
+  }
+  // Session fetches often mark the output Add/AddV2 in nodes_to_preserve; we
+  // still fuse because the replacement _FusedMatMul keeps add.name() (same
+  // tensor name).
+  if (HasControlFanin(*add_view) || add_view->NumRegularFanins() != 2) {
+    return false;
+  }
+
+  for (int add_mul_port = 0; add_mul_port < 2; ++add_mul_port) {
+    const auto* mul_view = add_view->GetRegularFanin(add_mul_port).node_view();
+    const auto* shift_view =
+        add_view->GetRegularFanin(1 - add_mul_port).node_view();
+
+    const utils::MutableNodeView *chain_view = nullptr, *scale_view = nullptr,
+                                 *shift_const_view = nullptr;
+    if (!MatchMulScaleBiasAddTail(ctx, mul_view, shift_view, &chain_view,
+                                  &scale_view, &shift_const_view)) {
+      continue;
+    }
+
+    const utils::MutableNodeView* bias_cast_view = nullptr;
+    const utils::MutableNodeView* bias_add_view = chain_view;
+    const NodeDef* chain_head_def = chain_view->node();
+    if (chain_head_def != nullptr && chain_head_def->op() == kCast) {
+      bias_cast_view = chain_view;
+      if (HasControlFanin(*bias_cast_view) ||
+          bias_cast_view->NumRegularFanins() < 1 ||
+          IsInPreserveSet(ctx, chain_head_def) ||
+          !HasAtMostOneFanoutAtPort0(*bias_cast_view)) {
+        continue;
+      }
+      bias_add_view = bias_cast_view->GetRegularFanin(0).node_view();
+    }
+    const auto* bias_add_def = bias_add_view->node();
+    int bias_port = 1;
+    if (bias_add_view == nullptr || bias_add_def == nullptr ||
+        (!IsBiasAdd(*bias_add_def) &&
+         !IsBiasSemanticAdd(ctx, *bias_add_view, &bias_port))) {
+      continue;
+    }
+    if (bias_add_view->NumRegularFanins() < 2) {
+      continue;
+    }
+    const auto& contraction_fanin =
+        bias_add_view->GetRegularFanin(1 - bias_port);
+    const auto* matmul_view = contraction_fanin.node_view();
+    const auto* matmul_def = matmul_view->node();
+    if (matmul_view == nullptr || matmul_def == nullptr) {
+      continue;
+    }
+    if (!IsMatMulZenOrBatchMatMul(*matmul_def)) {
+      continue;
+    }
+    if (!MatMulLikeNoTransposeOrAdj(*matmul_def)) {
+      continue;
+    }
+    if (!MatMulFoldRankOk(ctx, *matmul_def)) {
+      continue;
+    }
+    if (!NodeIsOnCpu(matmul_def)) {
+      continue;
+    }
+    if (HasControlFanin(*bias_add_view) ||
+        bias_add_view->NumRegularFanins() != 2 ||
+        IsInPreserveSet(ctx, bias_add_def)) {
+      continue;
+    }
+    if (HasControlFanin(*matmul_view) ||
+        !HasAtMostOneFanoutAtPort0(*matmul_view) ||
+        IsInPreserveSet(ctx, matmul_def)) {
+      continue;
+    }
+    if (!HasAtMostOneFanoutAtPort0(*bias_add_view)) {
+      continue;
+    }
+
+    if (HasDataType(matmul_def, DT_DOUBLE)) {
+      continue;
+    }
+
+    const auto* mul_def = mul_view->node();
+    DataType t_mm = GetDataTypeFromAttr(*matmul_def, "T");
+    DataType t_mul = GetDataTypeFromAttr(*mul_def, "T");
+    if (bias_cast_view != nullptr) {
+      DataType c_src = DT_INVALID, c_dst = DT_INVALID;
+      if (!GetCastDataTypes(*(bias_cast_view->node()), &c_src, &c_dst)) {
+        continue;
+      }
+      if (c_src != t_mm || c_dst != t_mul) {
+        continue;
+      }
+      if (!HaveSameDataType(add_def, mul_def)) {
+        continue;
+      }
+    } else {
+      if (!HaveSameDataType(add_def, matmul_def)) {
+        continue;
+      }
+      if (!HaveSameDataType(mul_def, matmul_def)) {
+        continue;
+      }
+    }
+
+    utils::MutableNodeView* w_mutable = const_cast<utils::MutableNodeView*>(
+        ctx.graph_view.GetNode(ParseTensorName(matmul_def->input(1)).node()));
+    utils::MutableNodeView* b_mutable =
+        const_cast<utils::MutableNodeView*>(ctx.graph_view.GetNode(
+            ParseTensorName(bias_add_def->input(bias_port)).node()));
+    if (w_mutable == nullptr || b_mutable == nullptr) {
+      continue;
+    }
+    int w_ix = PeelToConstProducerNodeIndex(ctx, w_mutable);
+    int b_ix = PeelToConstProducerNodeIndex(ctx, b_mutable);
+    if (w_ix < 0 || b_ix < 0) {
+      continue;
+    }
+    auto* w_node_view = ctx.graph_view.GetNode(w_ix);
+    auto* b_node_view = ctx.graph_view.GetNode(b_ix);
+    const NodeDef* w_def = w_node_view->node();
+    const NodeDef* b_def = b_node_view->node();
+    if (IsConstAlreadyBnFolded(w_def) || IsConstAlreadyBnFolded(b_def)) {
+      continue;
+    }
+
+    const NodeDef* scale_def = scale_view->node();
+    const NodeDef* shift_def = shift_const_view->node();
+
+    Tensor W;
+    Tensor B;
+    Tensor S;
+    Tensor H;
+    if (!GetTensorFromConstant(w_def, &W).ok() ||
+        !GetTensorFromConstant(b_def, &B).ok() ||
+        !GetTensorFromConstant(scale_def, &S).ok() ||
+        !GetTensorFromConstant(shift_def, &H).ok()) {
+      continue;
+    }
+    if (!FuseMatmulBNfoldTensorShapesOk(W, B, S, H, t_mm)) {
+      continue;
+    }
+
+    int tail_cast_ix = kMissingIndex;
+    const auto& add_fanouts = add_view->GetRegularFanout(0);
+    if (add_fanouts.size() == 1) {
+      const auto* tail_view = add_fanouts[0].node_view();
+      const NodeDef* tail_def =
+          tail_view != nullptr ? tail_view->node() : nullptr;
+      if (tail_view != nullptr && tail_def != nullptr && IsCast(*tail_def) &&
+          !HasControlFanin(*tail_view)) {
+        DataType tc_src = DT_INVALID, tc_dst = DT_INVALID;
+        if (GetCastDataTypes(*tail_def, &tc_src, &tc_dst) &&
+            tc_src == GetDataTypeFromAttr(*add_def, "T") && tc_dst == t_mm) {
+          tail_cast_ix = tail_view->node_index();
+        }
+      }
+    }
+
+    zendnnl::error_handling::apilog_info(
+        "Remapper: MatMulBiasMulAddFold full pattern matched (MatMul-like ",
+        matmul_def->op(), " ", matmul_def->name(), " -> BiasAdd -> Mul -> ",
+        add_def->op(), " ", add_def->name(), ")");
+
+    matched->matmul = matmul_view->node_index();
+    matched->bias_add = bias_add_view->node_index();
+    matched->mul = mul_view->node_index();
+    matched->add = node_index;
+    matched->scale_const = scale_view->node_index();
+    matched->shift_const = shift_const_view->node_index();
+    matched->bias_port = bias_port;
+    matched->bias_cast = bias_cast_view != nullptr
+                             ? bias_cast_view->node_index()
+                             : kMissingIndex;
+    matched->tail_cast = tail_cast_ix;
+    return true;
+  }
+  return false;
+}
+
+Status AddMatMulBiasMulAddFold(RemapperContext* ctx,
+                               const MatMulBiasMulAddFoldMatch& matched,
+                               std::vector<bool>* invalidated_nodes,
+                               std::vector<bool>* nodes_to_delete) {
+  const GraphDef* graph = ctx->graph_view.graph();
+  const NodeDef& matmul = graph->node(matched.matmul);
+  const NodeDef& bias_add = graph->node(matched.bias_add);
+  const NodeDef& add = graph->node(matched.add);
+
+  utils::MutableNodeView* w_mutable =
+      ctx->graph_view.GetNode(ParseTensorName(matmul.input(1)).node());
+  utils::MutableNodeView* b_mutable = ctx->graph_view.GetNode(
+      ParseTensorName(bias_add.input(matched.bias_port)).node());
+  if (w_mutable == nullptr || b_mutable == nullptr) {
+    return errors::Internal("MatMulBiasMulAddFold: missing weight/bias inputs");
+  }
+  int w_ix = PeelToConstProducerNodeIndex(*ctx, w_mutable);
+  int b_ix = PeelToConstProducerNodeIndex(*ctx, b_mutable);
+  if (w_ix < 0 || b_ix < 0) {
+    return errors::Internal(
+        "MatMulBiasMulAddFold: weight/bias must resolve to Const");
+  }
+  auto* w_view = ctx->graph_view.GetNode(w_ix);
+  auto* b_view = ctx->graph_view.GetNode(b_ix);
+  NodeDef* w_def = w_view->node();
+  NodeDef* b_def = b_view->node();
+  const NodeDef& scale_def = graph->node(matched.scale_const);
+  const NodeDef& shift_def = graph->node(matched.shift_const);
+
+  Tensor W;
+  Tensor B;
+  Tensor S;
+  Tensor H;
+  TF_RETURN_IF_ERROR(GetTensorFromConstant(w_def, &W));
+  TF_RETURN_IF_ERROR(GetTensorFromConstant(b_def, &B));
+  TF_RETURN_IF_ERROR(GetTensorFromConstant(&scale_def, &S));
+  TF_RETURN_IF_ERROR(GetTensorFromConstant(&shift_def, &H));
+
+  DataType t = GetDataTypeFromAttr(matmul, "T");
+  if (!FuseMatmulBNfoldTensorShapesOk(W, B, S, H, t)) {
+    return errors::Internal("MatMulBiasMulAddFold: invalid tensor shapes");
+  }
+
+  ApplyFuseMatmulBNfoldToTensors(&W, &B, S, H, t);
+
+  AttrValue w_attr;
+  AttrValue b_attr;
+  W.AsProtoTensorContent(w_attr.mutable_tensor());
+  B.AsProtoTensorContent(b_attr.mutable_tensor());
+
+  NodeDef fused_node;
+  fused_node.set_op(kFusedMatMul);
+  fused_node.set_name(add.name());
+  fused_node.set_device(matmul.device());
+  fused_node.add_input(matmul.input(0));
+  fused_node.add_input(matmul.input(1));
+  fused_node.add_input(bias_add.input(matched.bias_port));
+  CopyMatMulLikeAttributes(matmul, &fused_node);
+  SetFusedOpAttributes(&fused_node, {"BiasAdd"});
+
+  zendnnl::error_handling::apilog_info("Remapper: Fusing ", matmul.op(), " (",
+                                       matmul.name(), ") with Mul+Add fold");
+
+  utils::Mutation* mutation = ctx->graph_view.GetMutationBuilder();
+  Status status;
+  mutation->AddOrUpdateNodeAttr(w_view, "value", w_attr);
+  mutation->AddOrUpdateNodeAttr(b_view, "value", b_attr);
+  // Tag the rewritten Consts so a later pass/recheck cannot fold them twice.
+  MarkConstBnFolded(mutation, w_view);
+  MarkConstBnFolded(mutation, b_view);
+  mutation->AddNode(std::move(fused_node), &status);
+  TF_RETURN_IF_ERROR(status);
+  TF_RETURN_IF_ERROR(mutation->Apply());
+
+  const string& fused_out_name =
+      ctx->graph_view.graph()->node(matched.add).name();
+  if (matched.tail_cast != kMissingIndex) {
+    utils::MutableNodeView* tail_cast_view =
+        ctx->graph_view.GetNode(matched.tail_cast);
+    if (tail_cast_view == nullptr) {
+      return errors::Internal("MatMulBiasMulAddFold: tail Cast not found");
+    }
+    utils::Mutation* tail_mut = ctx->graph_view.GetMutationBuilder();
+    SafeTensorId safe_fused_out(fused_out_name, 0);
+    const TensorId fused_tid(safe_fused_out);
+    for (const auto& fo_set : tail_cast_view->GetRegularFanouts()) {
+      for (const auto& fo : fo_set) {
+        tail_mut->AddOrUpdateRegularFanin(fo.node_view(), fo.index(),
+                                          fused_tid);
+      }
+    }
+    for (const auto& ctrl : tail_cast_view->GetControlledFanouts()) {
+      tail_mut->RemoveControllingFanin(ctrl.node_view(),
+                                       tail_cast_view->node()->name());
+      tail_mut->AddControllingFanin(ctrl.node_view(), fused_out_name);
+    }
+    TF_RETURN_IF_ERROR(tail_mut->Apply());
+    (*nodes_to_delete)[matched.tail_cast] = true;
+  }
+
+  (*invalidated_nodes)[matched.add] = true;
+  (*nodes_to_delete)[matched.matmul] = true;
+  (*nodes_to_delete)[matched.bias_add] = true;
+  (*nodes_to_delete)[matched.mul] = true;
+  // Do not delete matched.add: Mutation::AddNode overwrote that NodeDef in
+  // place (same name as Add/AddV2); removing it would drop the fetch tensor.
+  (*nodes_to_delete)[matched.scale_const] = true;
+  (*nodes_to_delete)[matched.shift_const] = true;
+  if (matched.bias_cast != kMissingIndex) {
+    (*nodes_to_delete)[matched.bias_cast] = true;
+  }
+
+  return OkStatus();
+}
+
+bool FindFuseMatmulBNfold(const RemapperContext& ctx, int node_index,
+                          FuseMatmulBNfoldMatch* matched) {
+  const auto* add_view = ctx.graph_view.GetNode(node_index);
+  const auto* add_def = add_view->node();
+  if (add_def == nullptr || (!IsAdd(*add_def) && add_def->op() != kAddV2)) {
+    return false;
+  }
+  // Same as FindMatMulBiasMulAddFold: allow fetch roots in nodes_to_preserve.
+  if (HasControlFanin(*add_view) || add_view->NumRegularFanins() != 2) {
+    return false;
+  }
+
+  for (int add_mul_port = 0; add_mul_port < 2; ++add_mul_port) {
+    const auto* mul_view = add_view->GetRegularFanin(add_mul_port).node_view();
+    const auto* shift_view =
+        add_view->GetRegularFanin(1 - add_mul_port).node_view();
+
+    const utils::MutableNodeView *fused_view = nullptr, *scale_view = nullptr,
+                                 *shift_const_view = nullptr;
+    if (!MatchMulScaleBiasAddTail(ctx, mul_view, shift_view, &fused_view,
+                                  &scale_view, &shift_const_view)) {
+      continue;
+    }
+
+    const utils::MutableNodeView* bias_cast_view = nullptr;
+    const utils::MutableNodeView* fused_inner_view = fused_view;
+    const NodeDef* chain_head_def = fused_view->node();
+    if (chain_head_def != nullptr && chain_head_def->op() == kCast) {
+      bias_cast_view = fused_view;
+      if (HasControlFanin(*bias_cast_view) ||
+          bias_cast_view->NumRegularFanins() < 1 ||
+          IsInPreserveSet(ctx, chain_head_def) ||
+          !HasAtMostOneFanoutAtPort0(*bias_cast_view)) {
+        continue;
+      }
+      fused_inner_view = bias_cast_view->GetRegularFanin(0).node_view();
+    }
+    const auto* fused_def =
+        fused_inner_view != nullptr ? fused_inner_view->node() : nullptr;
+    if (fused_def == nullptr || !IsFusedMatMulBiasAddOnly(*fused_def)) continue;
+    if (!NodeIsOnCpu(fused_def)) continue;
+    if (HasControlFanin(*fused_inner_view) ||
+        !HasAtMostOneFanoutAtPort0(*fused_inner_view) ||
+        IsInPreserveSet(ctx, fused_def)) {
+      continue;
+    }
+
+    bool transpose_a = false;
+    bool transpose_b = false;
+    if (fused_def->attr().contains("transpose_a")) {
+      transpose_a = fused_def->attr().at("transpose_a").b();
+    }
+    if (fused_def->attr().contains("transpose_b")) {
+      transpose_b = fused_def->attr().at("transpose_b").b();
+    }
+    if (transpose_a || transpose_b) continue;
+    if (HasDataType(fused_def, DT_DOUBLE)) continue;
+
+    const auto* mul_def = mul_view->node();
+    DataType t_mm = GetDataTypeFromAttr(*fused_def, "T");
+    DataType t_mul = GetDataTypeFromAttr(*mul_def, "T");
+    if (bias_cast_view != nullptr) {
+      DataType c_src = DT_INVALID, c_dst = DT_INVALID;
+      if (!GetCastDataTypes(*(bias_cast_view->node()), &c_src, &c_dst)) {
+        continue;
+      }
+      if (c_src != t_mm || c_dst != t_mul) continue;
+      if (!HaveSameDataType(add_def, mul_def)) continue;
+    } else {
+      if (!HaveSameDataType(add_def, fused_def)) continue;
+      if (!HaveSameDataType(mul_def, fused_def)) continue;
+    }
+
+    utils::MutableNodeView* w_mutable = const_cast<utils::MutableNodeView*>(
+        ctx.graph_view.GetNode(ParseTensorName(fused_def->input(1)).node()));
+    utils::MutableNodeView* b_mutable = const_cast<utils::MutableNodeView*>(
+        ctx.graph_view.GetNode(ParseTensorName(fused_def->input(2)).node()));
+    if (w_mutable == nullptr || b_mutable == nullptr) continue;
+    int w_ix = PeelToConstProducerNodeIndex(ctx, w_mutable);
+    int b_ix = PeelToConstProducerNodeIndex(ctx, b_mutable);
+    if (w_ix < 0 || b_ix < 0) continue;
+    auto* w_node_view = ctx.graph_view.GetNode(w_ix);
+    auto* b_node_view = ctx.graph_view.GetNode(b_ix);
+    const NodeDef* w_def = w_node_view->node();
+    const NodeDef* b_def = b_node_view->node();
+    if (IsConstAlreadyBnFolded(w_def) || IsConstAlreadyBnFolded(b_def)) {
+      continue;
+    }
+
+    const NodeDef* scale_def = scale_view->node();
+    const NodeDef* shift_def = shift_const_view->node();
+
+    Tensor W;
+    Tensor B;
+    Tensor S;
+    Tensor H;
+    if (!GetTensorFromConstant(w_def, &W).ok() ||
+        !GetTensorFromConstant(b_def, &B).ok() ||
+        !GetTensorFromConstant(scale_def, &S).ok() ||
+        !GetTensorFromConstant(shift_def, &H).ok()) {
+      continue;
+    }
+    if (!FuseMatmulBNfoldTensorShapesOk(W, B, S, H, t_mm)) continue;
+
+    int tail_cast_ix = kMissingIndex;
+    const auto& add_fanouts = add_view->GetRegularFanout(0);
+    if (add_fanouts.size() == 1) {
+      const auto* tail_view = add_fanouts[0].node_view();
+      const NodeDef* tail_def =
+          tail_view != nullptr ? tail_view->node() : nullptr;
+      if (tail_view != nullptr && tail_def != nullptr && IsCast(*tail_def) &&
+          !HasControlFanin(*tail_view)) {
+        DataType tc_src = DT_INVALID, tc_dst = DT_INVALID;
+        if (GetCastDataTypes(*tail_def, &tc_src, &tc_dst) &&
+            tc_src == GetDataTypeFromAttr(*add_def, "T") && tc_dst == t_mm) {
+          tail_cast_ix = tail_view->node_index();
+        }
+      }
+    }
+
+    matched->fused_matmul = fused_inner_view->node_index();
+    matched->mul = mul_view->node_index();
+    matched->add = node_index;
+    matched->scale_const = scale_view->node_index();
+    matched->shift_const = shift_const_view->node_index();
+    matched->bias_cast = bias_cast_view != nullptr
+                             ? bias_cast_view->node_index()
+                             : kMissingIndex;
+    matched->tail_cast = tail_cast_ix;
+    return true;
+  }
+  return false;
+}
+
+Status AddFuseMatmulBNfold(RemapperContext* ctx,
+                           const FuseMatmulBNfoldMatch& matched,
+                           std::vector<bool>* invalidated_nodes,
+                           std::vector<bool>* nodes_to_delete) {
+  const GraphDef* graph = ctx->graph_view.graph();
+  const NodeDef& fused = graph->node(matched.fused_matmul);
+  const NodeDef& add = graph->node(matched.add);
+
+  utils::MutableNodeView* w_mutable =
+      ctx->graph_view.GetNode(ParseTensorName(fused.input(1)).node());
+  utils::MutableNodeView* b_mutable =
+      ctx->graph_view.GetNode(ParseTensorName(fused.input(2)).node());
+  if (w_mutable == nullptr || b_mutable == nullptr) {
+    return errors::Internal("FuseMatmulBNfold: missing weight/bias inputs");
+  }
+  int w_ix = PeelToConstProducerNodeIndex(*ctx, w_mutable);
+  int b_ix = PeelToConstProducerNodeIndex(*ctx, b_mutable);
+  if (w_ix < 0 || b_ix < 0) {
+    return errors::Internal(
+        "FuseMatmulBNfold: weight/bias must resolve to Const");
+  }
+  auto* w_view = ctx->graph_view.GetNode(w_ix);
+  auto* b_view = ctx->graph_view.GetNode(b_ix);
+  NodeDef* w_def = w_view->node();
+  NodeDef* b_def = b_view->node();
+  const NodeDef& scale_def = graph->node(matched.scale_const);
+  const NodeDef& shift_def = graph->node(matched.shift_const);
+
+  Tensor W;
+  Tensor B;
+  Tensor S;
+  Tensor H;
+  TF_RETURN_IF_ERROR(GetTensorFromConstant(w_def, &W));
+  TF_RETURN_IF_ERROR(GetTensorFromConstant(b_def, &B));
+  TF_RETURN_IF_ERROR(GetTensorFromConstant(&scale_def, &S));
+  TF_RETURN_IF_ERROR(GetTensorFromConstant(&shift_def, &H));
+
+  DataType t = GetDataTypeFromAttr(fused, "T");
+  if (!FuseMatmulBNfoldTensorShapesOk(W, B, S, H, t)) {
+    return errors::Internal("FuseMatmulBNfold: invalid tensor shapes");
+  }
+
+  ApplyFuseMatmulBNfoldToTensors(&W, &B, S, H, t);
+
+  AttrValue w_attr;
+  AttrValue b_attr;
+  W.AsProtoTensorContent(w_attr.mutable_tensor());
+  B.AsProtoTensorContent(b_attr.mutable_tensor());
+
+  NodeDef new_node;
+  new_node.set_op(fused.op());
+  new_node.set_name(add.name());
+  new_node.set_device(fused.device());
+  CopyAllAttrs(fused, &new_node);
+  for (int i = 0; i < fused.input_size(); ++i) {
+    new_node.add_input(fused.input(i));
+  }
+
+  zendnnl::error_handling::apilog_info("Remapper: Fusing ", fused.op(), " (",
+                                       fused.name(), ") with FuseMatmulBNfold");
+
+  utils::Mutation* mutation = ctx->graph_view.GetMutationBuilder();
+  Status status;
+  mutation->AddOrUpdateNodeAttr(w_view, "value", w_attr);
+  mutation->AddOrUpdateNodeAttr(b_view, "value", b_attr);
+  // Tag the rewritten Consts so a later pass/recheck cannot fold them twice.
+  MarkConstBnFolded(mutation, w_view);
+  MarkConstBnFolded(mutation, b_view);
+  mutation->AddNode(std::move(new_node), &status);
+  TF_RETURN_IF_ERROR(status);
+  TF_RETURN_IF_ERROR(mutation->Apply());
+
+  const string& fused_out_name =
+      ctx->graph_view.graph()->node(matched.add).name();
+  if (matched.tail_cast != kMissingIndex) {
+    utils::MutableNodeView* tail_cast_view =
+        ctx->graph_view.GetNode(matched.tail_cast);
+    if (tail_cast_view == nullptr) {
+      return errors::Internal("FuseMatmulBNfold: tail Cast not found");
+    }
+    utils::Mutation* tail_mut = ctx->graph_view.GetMutationBuilder();
+    SafeTensorId safe_fused_out(fused_out_name, 0);
+    const TensorId fused_tid(safe_fused_out);
+    for (const auto& fo_set : tail_cast_view->GetRegularFanouts()) {
+      for (const auto& fo : fo_set) {
+        tail_mut->AddOrUpdateRegularFanin(fo.node_view(), fo.index(),
+                                          fused_tid);
+      }
+    }
+    for (const auto& ctrl : tail_cast_view->GetControlledFanouts()) {
+      tail_mut->RemoveControllingFanin(ctrl.node_view(),
+                                       tail_cast_view->node()->name());
+      tail_mut->AddControllingFanin(ctrl.node_view(), fused_out_name);
+    }
+    TF_RETURN_IF_ERROR(tail_mut->Apply());
+    (*nodes_to_delete)[matched.tail_cast] = true;
+  }
+
+  (*invalidated_nodes)[matched.add] = true;
+  (*nodes_to_delete)[matched.fused_matmul] = true;
+  (*nodes_to_delete)[matched.mul] = true;
+  // Same as AddMatMulBiasMulAddFold: new_node uses add.name() and overwrites
+  // Add.
+  (*nodes_to_delete)[matched.scale_const] = true;
+  (*nodes_to_delete)[matched.shift_const] = true;
+  if (matched.bias_cast != kMissingIndex) {
+    (*nodes_to_delete)[matched.bias_cast] = true;
+  }
+
+  return OkStatus();
+}
 }  // namespace
 
 Status RunRemapper(const char* device_name, const GrapplerItem& item,
@@ -3900,6 +6324,60 @@ Status RunRemapper(const char* device_name, const GrapplerItem& item,
             "Remapper: Found ContractionWithSigmoid");
         AddFusedMatMulSigmoidNode(&ctx, contract_with_sigmoid,
                                   &invalidated_nodes, &nodes_to_delete);
+        continue;
+      }
+
+      // MatMul+BiasAdd + Keras decomposed inference BN -> _FusedMatMul.
+      MatMulBiasKerasBnFoldMatch mm_bias_keras_bn;
+      if (FindMatMulBiasKerasBnFold(ctx, i, &mm_bias_keras_bn)) {
+        zendnnl::error_handling::apilog_info(
+            "Remapper: Found MatMulBiasKerasBnFold");
+        TF_RETURN_IF_ERROR(AddMatMulBiasKerasBnFold(
+            &ctx, mm_bias_keras_bn, &invalidated_nodes, &nodes_to_delete));
+        continue;
+      }
+
+      // MatMul+BiasAdd+Mul+Add|AddV2 -> _FusedMatMul (scale/shift folded into
+      // Consts).
+      MatMulBiasMulAddFoldMatch mm_bias_mul_add;
+      if (FindMatMulBiasMulAddFold(ctx, i, &mm_bias_mul_add)) {
+        zendnnl::error_handling::apilog_info(
+            "Remapper: Found MatMulBiasMulAddFold");
+        TF_RETURN_IF_ERROR(AddMatMulBiasMulAddFold(
+            &ctx, mm_bias_mul_add, &invalidated_nodes, &nodes_to_delete));
+        continue;
+      }
+
+      // _FusedMatMul + Mul + Add (after MatMul+BiasAdd -> _FusedMatMul, same
+      // pass).
+      FuseMatmulBNfoldMatch fuse_matmul_bn;
+      if (FindFuseMatmulBNfold(ctx, i, &fuse_matmul_bn)) {
+        zendnnl::error_handling::apilog_info(
+            "Remapper: Found FuseMatmulBNfold");
+        TF_RETURN_IF_ERROR(AddFuseMatmulBNfold(
+            &ctx, fuse_matmul_bn, &invalidated_nodes, &nodes_to_delete));
+        continue;
+      }
+
+      // Remap _FusedMatMul{MatMul + BiasAdd} + Mish into _FusedMatMul (after BN
+      // fold patterns so BN can rewrite weights/bias on BiasAdd-only fusion).
+      ContractionWithActivation contract_with_mish;
+      if (FindContractionWithMish(ctx, i, &contract_with_mish)) {
+        zendnnl::error_handling::apilog_info(
+            "Remapper: Found ContractionWithMish");
+        TF_RETURN_IF_ERROR(AddFusedMatMulMishNode(
+            &ctx, contract_with_mish, &invalidated_nodes, &nodes_to_delete));
+        continue;
+      }
+
+      // _FusedMatMul -> Softplus -> Tanh -> Mul(x, tanh(...))  (decomposed
+      // Mish).
+      FusedMatMulMishDecomposedMatch mish_decomposed;
+      if (FindFusedMatMulMishDecomposedPattern(ctx, i, &mish_decomposed)) {
+        zendnnl::error_handling::apilog_info(
+            "Remapper: Found FusedMatMulMishDecomposed");
+        TF_RETURN_IF_ERROR(AddFusedMatMulMishDecomposed(
+            &ctx, mish_decomposed, &invalidated_nodes, &nodes_to_delete));
         continue;
       }
 

@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Modifications Copyright (c) 2025 Advanced Micro Devices, Inc. All rights
+ * Modifications Copyright (c) 2026 Advanced Micro Devices, Inc. All rights
  * reserved. Notified per clause 4(b) of the license.
  ******************************************************************************/
 
@@ -135,6 +135,7 @@ bool IsMean(const NodeDef& node);
 bool IsMerge(const NodeDef& node);
 bool IsMin(const NodeDef& node);
 bool IsMinimum(const NodeDef& node);
+bool IsMish(const NodeDef& node);
 bool IsMirrorPad(const NodeDef& node);
 bool IsMirrorPadGrad(const NodeDef& node);
 bool IsMod(const NodeDef& node);
@@ -194,6 +195,7 @@ bool IsSize(const NodeDef& node);
 bool IsSlice(const NodeDef& node);
 bool IsSnapshot(const NodeDef& node);
 bool IsSoftmax(const NodeDef& node);
+bool IsSoftplus(const NodeDef& node);
 bool IsSoftplusGrad(const NodeDef& node);
 bool IsSoftsignGrad(const NodeDef& node);
 bool IsSplit(const NodeDef& node);

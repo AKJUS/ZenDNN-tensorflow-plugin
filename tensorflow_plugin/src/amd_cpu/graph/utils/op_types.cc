@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Modifications Copyright (c) 2025 Advanced Micro Devices, Inc. All rights
+ * Modifications Copyright (c) 2026 Advanced Micro Devices, Inc. All rights
  * reserved. Notified per clause 4(b) of the license.
  ******************************************************************************/
 
@@ -428,6 +428,8 @@ bool IsMin(const NodeDef& node) { return node.op() == "Min"; }
 
 bool IsMinimum(const NodeDef& node) { return node.op() == "Minimum"; }
 
+bool IsMish(const NodeDef& node) { return node.op() == "Mish"; }
+
 bool IsMirrorPad(const NodeDef& node) { return node.op() == "MirrorPad"; }
 
 bool IsMirrorPadGrad(const NodeDef& node) {
@@ -598,6 +600,8 @@ bool IsSlice(const NodeDef& node) { return node.op() == "Slice"; }
 bool IsSnapshot(const NodeDef& node) { return node.op() == "Snapshot"; }
 
 bool IsSoftmax(const NodeDef& node) { return node.op() == "Softmax"; }
+
+bool IsSoftplus(const NodeDef& node) { return node.op() == "Softplus"; }
 
 bool IsSoftplusGrad(const NodeDef& node) { return node.op() == "SoftplusGrad"; }
 

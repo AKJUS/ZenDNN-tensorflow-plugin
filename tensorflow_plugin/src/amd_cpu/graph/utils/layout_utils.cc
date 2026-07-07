@@ -97,6 +97,7 @@ bool RewriteFusedMatMul(const utils::MutableNodeView& node_view) {
           fused_ops == std::vector<string>{"BiasAdd", "Add"} ||
           fused_ops == std::vector<string>{"BiasAdd", "Relu"} ||
           fused_ops == std::vector<string>{"BiasAdd", "Sigmoid"} ||
+          fused_ops == std::vector<string>{"BiasAdd", "Mish"} ||
           fused_ops == std::vector<string>{"BiasAdd", "Add", "Relu"} ||
           fused_ops == std::vector<string>{"BiasAdd", "Tanh"} ||
           fused_ops == std::vector<string>{"BiasAdd", "GeluExact"} ||
