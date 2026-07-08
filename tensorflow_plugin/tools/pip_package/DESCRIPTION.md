@@ -1,8 +1,8 @@
-__The latest ZenDNN Plugin for TensorFlow* (zentf) is here!__
+__The latest ZenDNN Plugin for TensorFlow* (zentf) {{ZENTF_VERSION}} is here!__
 
 The ZenDNN plugin for TensorFlow is called zentf.
 
-The zentf plugin works seamlessly with TensorFlow {{TF_VERSION}}, offering a high-performance experience for deep learning on AMD EPYC™ platforms.
+The zentf {{ZENTF_VERSION}} plugin works seamlessly with TensorFlow {{TF_VERSION}}, offering a high-performance experience for deep learning on AMD EPYC™ platforms.
 
 In addition to stable (GA) releases, the zentf plugin provides weekly releases via the `zentf-weekly` package on PyPI.
 

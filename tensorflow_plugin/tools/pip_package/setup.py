@@ -28,8 +28,26 @@ from setuptools.command.install import install as InstallCommandBase
 from setuptools.dist import Distribution
 
 # Auto-detect TF version from package metadata (avoids importing TF).
-# Only _PLUGIN_PATCH is maintained manually.
-_PLUGIN_PATCH = '0'
+# The 4th version component ("plugin patch") is tracked per exact TF base
+# version (major.minor.patch), so each supported TF release (including its patch
+# level) carries its own plugin patch. A TF base that is not listed defaults to
+# 0, so a brand-new TF release automatically starts at <tf>.0 without a code
+# change. Only bump a value when cutting a follow-up zentf release for the same
+# TF base.
+_PLUGIN_PATCH_BY_TF = {
+    '2.21.0': 1,
+    '2.20.0': 1,
+    '2.19.1': 1,
+    '2.19.0': 1,
+    '2.18.1': 1,
+    '2.18.0': 1,
+    '2.17.1': 1,
+    '2.17.0': 1,
+    '2.16.2': 1,
+    '2.16.1': 1,
+}
+_DEFAULT_PLUGIN_PATCH = 0
+_FALLBACK_TF_BASE = '2.21.0'
 
 def _detect_tf_version():
   """Return a clean MAJOR.MINOR.PATCH.PLUGIN_PATCH version string.
@@ -37,7 +55,9 @@ def _detect_tf_version():
   Checks TF_VERSION env var first (set by build_pip_package.sh), then
   probes package metadata for tensorflow, tensorflow-cpu, and tf-nightly.
   Strips pre/post/dev markers (rc, .post, .dev) to produce a valid
-  PEP 440 version.
+  PEP 440 version. The plugin patch component is resolved per exact TF base
+  (major.minor.patch) via _PLUGIN_PATCH_BY_TF, defaulting to
+  _DEFAULT_PLUGIN_PATCH for unlisted bases.
   """
   import re as _re
   raw = os.environ.get('TF_VERSION', '')
@@ -50,12 +70,15 @@ def _detect_tf_version():
       except Exception:
         continue
   if not raw:
-    return '2.21.0.%s' % _PLUGIN_PATCH
-  clean = _re.split(r'(\.dev|\.post|rc|-)', raw)[0]
-  parts = clean.split('.')[:3]
-  while len(parts) < 3:
-    parts.append('0')
-  return '%s.%s.%s.%s' % (parts[0], parts[1], parts[2], _PLUGIN_PATCH)
+    tf_base = _FALLBACK_TF_BASE
+  else:
+    clean = _re.split(r'(\.dev|\.post|rc|-)', raw)[0]
+    parts = clean.split('.')[:3]
+    while len(parts) < 3:
+      parts.append('0')
+    tf_base = '%s.%s.%s' % (parts[0], parts[1], parts[2])
+  plugin_patch = _PLUGIN_PATCH_BY_TF.get(tf_base, _DEFAULT_PLUGIN_PATCH)
+  return '%s.%d' % (tf_base, plugin_patch)
 
 _VERSION = _detect_tf_version()
 # this path can't be modified.
@@ -233,6 +256,11 @@ _desc_file = "DESCRIPTION_weekly.md" if _RELEASE_TYPE == 'weekly' else "DESCRIPT
 with open(os.path.join(curr_dir, _desc_file), encoding="utf-8") as f:
   long_description = f.read()
 long_description = long_description.replace('{{TF_VERSION}}', _tf_ver)
+# Weekly builds keep the .dev<date> suffix in the package metadata only, not in
+# the rendered description, so strip it for display purposes.
+_zentf_display_version = _VERSION.split('.dev')[0]
+long_description = long_description.replace(
+    '{{ZENTF_VERSION}}', _zentf_display_version)
 
 _source_tag = os.environ.get('ZENTF_SOURCE_TAG', '')
 _tag_commit = os.environ.get('ZENTF_TAG_COMMIT', '')

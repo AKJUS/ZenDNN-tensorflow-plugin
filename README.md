@@ -1,12 +1,12 @@
 # TensorFlow-ZenDNN Plug-in For AMD CPUs
 
-__The latest ZenDNN Plugin for TensorFlow* (zentf) 2.21.0.0 is here!__
+__The latest ZenDNN Plugin for TensorFlow* (zentf) 2.21.0.1 is here!__
 
 The ZenDNN plugin for TensorFlow is called zentf.
 
-The zentf 2.21.0.0 plugin works seamlessly with TensorFlow version 2.21.0, offering a high-performance experience for deep learning on AMD EPYC™ platforms.
+The zentf 2.21.0.1 plugin works seamlessly with TensorFlow version 2.21.0, offering a high-performance experience for deep learning on AMD EPYC™ platforms.
 
-> **Versioning:** Starting with this release, zentf follows TensorFlow's version numbering. The version format is `TF_MAJOR.TF_MINOR.TF_PATCH.PLUGIN_PATCH` (e.g., `2.21.0.0` targets TensorFlow 2.21.0).
+> **Versioning:** Starting with this release, zentf follows TensorFlow's version numbering. The version format is `TF_MAJOR.TF_MINOR.TF_PATCH.PLUGIN_PATCH` (e.g., `2.21.0.1` targets TensorFlow 2.21.0).
 
 ## Support
 
@@ -49,8 +49,8 @@ This section explains how to use the Python interface. For Java and C++ interfac
 ## Prerequisite
 * Create conda environment and activate it.
   ```
-  conda create -n tf-v2.21.0-zentf-v2.21.0.0-env python=3.10 -y
-  conda activate tf-v2.21.0-zentf-v2.21.0.0-env
+  conda create -n tf-v2.21.0-zentf-v2.21.0.1-env python=3.10 -y
+  conda activate tf-v2.21.0-zentf-v2.21.0.1-env
   ```
   > **Note:** Python 3.10 used here for example.
 * Install TensorFlow v2.21.0
@@ -122,7 +122,7 @@ bazel-bin/tensorflow_plugin/tools/pip_package/build_pip_package .
 
 ### 6. Install wheel file using pip:
 ```
-pip install zentf-2.21.0.0-cp310-cp310-linux_x86_64.whl
+pip install zentf-2.21.0.1-cp310-cp310-linux_x86_64.whl
 ```
 
 **The build and installation from source is done!**
@@ -173,7 +173,7 @@ I0000 00:00:1781633400.198792 1330299 custom_graph_optimizer_registry.cc:117] Pl
 * [AMD-TensorFlow blog](https://blog.tensorflow.org/2023/03/enabling-optimal-inference-performance-on-amd-epyc-processors-with-the-zendnn-library.html)
 
 # Performance tuning and Benchmarking
-* zentf v2.21.0.0 is supported with ZenDNN v6.0.0. For detailed performance tuning guidelines, refer to the [Performance Tuning](https://docs.amd.com/r/en-US/57300-ZenDNN-user-guide/Performance-Tuning) section of the ZenDNN user guide.
+* zentf v2.21.0.1 is supported with ZenDNN v6.0.0. For detailed performance tuning guidelines, refer to the [Performance Tuning](https://docs.amd.com/r/en-US/57300-ZenDNN-user-guide/Performance-Tuning) section of the ZenDNN user guide.
 
 # Additional Utilities:
 

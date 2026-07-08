@@ -2,9 +2,7 @@ __ZenDNN Plugin for TensorFlow* (zentf) - Weekly Release__
 
 The ZenDNN plugin for TensorFlow is called zentf.
 
-This is a **weekly** release of zentf, published as `zentf-weekly` on PyPI. Weekly releases follow a 2-week cadence: code cutoff on Wednesday, validation during the following week, and publication the next Wednesday.
-
-The zentf plugin works seamlessly with TensorFlow {{TF_VERSION}}, offering a high-performance experience for deep learning on AMD EPYC™ platforms.
+The zentf {{ZENTF_VERSION}} plugin works seamlessly with TensorFlow {{TF_VERSION}}, offering a high-performance experience for deep learning on AMD EPYC™ platforms.
 
 For stable (GA) releases, install the `zentf` package instead.
 

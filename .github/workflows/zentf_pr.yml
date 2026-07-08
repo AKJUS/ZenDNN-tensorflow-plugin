@@ -70,7 +70,7 @@ jobs:
     if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch'}} 
     env:
       PYTHON_VERSION: '3.12'
-      ZENTF_PLUGIN_VERSION: '2.21.0.0'
+      ZENTF_PLUGIN_VERSION: '2.21.0.1'
       NATIVE_TF_VERSION: '2.21.0'
       KERNELS_LIST: "avgpool maxpool softmax conv2d fusedConv2D fusedDepthwiseConv2d fused_matmul matmul"
       blis_release_hash: '9d639f1a874492ac7668cba2c25623eb6dca7203a4aeae757ce7e62ca87bc319'
@@ -482,7 +482,7 @@ jobs:
     if: ${{ github.event_name == 'push' }}
     env:
       PYTHON_VERSION: '3.12'
-      ZENTF_PLUGIN_VERSION: '2.21.0.0'
+      ZENTF_PLUGIN_VERSION: '2.21.0.1'
       NATIVE_TF_VERSION: '2.21.0'
       KERNELS_LIST: "avgpool maxpool softmax conv2d fusedConv2D fusedDepthwiseConv2d fused_matmul matmul"
       blis_release_hash: '9d639f1a874492ac7668cba2c25623eb6dca7203a4aeae757ce7e62ca87bc319'
