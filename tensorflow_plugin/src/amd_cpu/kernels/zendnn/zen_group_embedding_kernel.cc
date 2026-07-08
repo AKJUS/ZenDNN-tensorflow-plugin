@@ -15,6 +15,7 @@
  *
  *******************************************************************************/
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -136,29 +137,32 @@ class ZenGroupEmbeddingOp : public OpKernel {
                       " inner_size=", inner_size));
     }
 
-    const int64_t num_indices = context->input(idx_input_base).NumElements();
-    for (int i = 1; i < num_lookups_; ++i) {
-      OP_REQUIRES(
-          context,
-          context->input(idx_input_base + i).NumElements() == num_indices,
-          errors::InvalidArgument(
-              "_ZenGroupEmbedding: index tensor size mismatch: ",
-              context->input(idx_input_base + i).NumElements(), " vs ",
-              num_indices));
+    // Each gather may have a different number of indices (e.g., swipe_l2's
+    // per-feature Const index lists of varying length). Read each index
+    // tensor's element count and precompute its column span and offset into
+    // the output row: gather j occupies
+    //   [gather_col_offset[j], gather_col_offset[j] + idx_counts[j]*inner_size)
+    // Index inputs are ordered table-by-table matching the compute loops
+    // below, so a simple prefix sum over global gather index j is correct.
+    std::vector<int64_t> idx_counts(num_lookups_);
+    std::vector<int64_t> gather_col_offset(num_lookups_);
+    int64_t gather_row_features = 0;
+    int64_t max_gather_features = 0;
+    for (int i = 0; i < num_lookups_; ++i) {
+      const int64_t cnt = context->input(idx_input_base + i).NumElements();
+      idx_counts[i] = cnt;
+      gather_col_offset[i] = gather_row_features;
+      const int64_t feats = cnt * inner_size;
+      gather_row_features += feats;
+      max_gather_features = std::max(max_gather_features, feats);
     }
 
     zendnnl::error_handling::apilog_info(
         "_ZenGroupEmbedding Compute: num_tables=", num_tables_,
         ", num_lookups=", num_lookups_, ", gather_axis=", gather_axis_,
         " (normalized=", axis, ")", ", outer_size=", outer_size,
-        ", inner_size=", inner_size, ", num_indices=", num_indices);
-
-    // Compute gather features per output row.
-    const int64_t per_index_features = num_indices * inner_size;
-    int64_t gather_row_features = 0;
-    for (int g : gathers_per_table_) {
-      gather_row_features += g * per_index_features;
-    }
+        ", inner_size=", inner_size,
+        ", gather_row_features=", gather_row_features);
 
     // Passthrough: appended after gather results in each output row.
     int64_t pt_row_features = 0;
@@ -196,6 +200,11 @@ class ZenGroupEmbeddingOp : public OpKernel {
                                  : data_type_t::s64;
 
     T_output* out_data = output->flat<T_output>().data();
+    // Zero-initialize output buffer to prevent uninitialized memory leaking
+    // through if group_embedding_bag_direct or gather logic doesn't populate
+    // every element (e.g., nondeterministic ZenDNN function behavior, edge
+    // cases).
+    output->flat<T_output>().setZero();
 
     // Threshold for choosing direct gather vs embedding_bag path.
     // For small feature counts (<16 features per index), the direct gather
@@ -206,8 +215,10 @@ class ZenGroupEmbeddingOp : public OpKernel {
     // for different hardware configurations
     constexpr int64_t kDirectGatherThreshold = 16;
     // Choose between direct gather loop (small per-op work) and
-    // group_embedding_bag_direct (large embedding vectors).
-    const bool use_direct = (per_index_features < kDirectGatherThreshold);
+    // group_embedding_bag_direct (large embedding vectors). Base the decision
+    // on the largest per-gather feature span so it matches the original
+    // (uniform) behaviour when all index counts are equal.
+    const bool use_direct = (max_gather_features < kDirectGatherThreshold);
 
     if (use_direct) {
       // Direct path: simple indexed copy with inline type conversion.
@@ -215,9 +226,8 @@ class ZenGroupEmbeddingOp : public OpKernel {
       zendnnl::error_handling::apilog_info(
           "_ZenGroupEmbedding direct gather: num_lookups=", num_lookups_,
           ", outer_size=", outer_size,
-          ", per_index_features=", per_index_features);
+          ", gather_row_features=", gather_row_features);
 
-      int64_t col_offset = 0;
       int idx_cursor = 0;
 
       for (int t = 0; t < num_tables_; ++t) {
@@ -228,10 +238,13 @@ class ZenGroupEmbeddingOp : public OpKernel {
         const int num_gathers = gathers_per_table_[t];
 
         for (int g = 0; g < num_gathers; ++g) {
-          const Tensor& idx_t = context->input(idx_input_base + idx_cursor + g);
+          const int j = idx_cursor + g;
+          const Tensor& idx_t = context->input(idx_input_base + j);
           const T_indices* idx_data = idx_t.flat<T_indices>().data();
+          const int64_t count = idx_counts[j];
+          const int64_t col_offset = gather_col_offset[j];
 
-          for (int64_t ni = 0; ni < num_indices; ++ni) {
+          for (int64_t ni = 0; ni < count; ++ni) {
             const int64_t idx_val = static_cast<int64_t>(idx_data[ni]);
             OP_REQUIRES(
                 context, idx_val >= 0 && idx_val < gather_dim,
@@ -248,7 +261,6 @@ class ZenGroupEmbeddingOp : public OpKernel {
               }
             }
           }
-          col_offset += per_index_features;
         }
         idx_cursor += num_gathers;
       }
@@ -274,7 +286,6 @@ class ZenGroupEmbeddingOp : public OpKernel {
       std::vector<void*> dst_ptrs(total_ops);
       std::vector<embag_params_t> params(total_ops);
 
-      int64_t output_col_offset = 0;
       int idx_cursor = 0;
       int64_t op_cursor = 0;
 
@@ -285,33 +296,33 @@ class ZenGroupEmbeddingOp : public OpKernel {
         const int64_t table_outer_stride = gather_dim * inner_size;
         const int num_gathers = gathers_per_table_[t];
 
-        embag_params_t ep;
-        ep.dtypes.table = table_dt;
-        ep.dtypes.output = output_dt;
-        ep.dtypes.indices = indices_dt;
-        ep.algo = embag_algo_t::none;
-        ep.num_embeddings = static_cast<uint64_t>(gather_dim);
-        ep.embedding_dim = static_cast<uint64_t>(inner_size);
-        ep.num_indices = static_cast<uint64_t>(num_indices);
-        ep.num_bags = 0;
-        ep.is_weights = false;
-        ep.include_last_offset = false;
-        ep.padding_idx = -1;
-
         for (int64_t o = 0; o < outer_size; ++o) {
           for (int g = 0; g < num_gathers; ++g) {
+            const int j = idx_cursor + g;
             const int64_t op_idx = op_cursor + o * num_gathers + g;
-            const Tensor& idx = context->input(idx_input_base + idx_cursor + g);
+            const Tensor& idx = context->input(idx_input_base + j);
+
+            embag_params_t ep;
+            ep.dtypes.table = table_dt;
+            ep.dtypes.output = output_dt;
+            ep.dtypes.indices = indices_dt;
+            ep.algo = embag_algo_t::none;
+            ep.num_embeddings = static_cast<uint64_t>(gather_dim);
+            ep.embedding_dim = static_cast<uint64_t>(inner_size);
+            ep.num_indices = static_cast<uint64_t>(idx_counts[j]);
+            ep.num_bags = 0;
+            ep.is_weights = false;
+            ep.include_last_offset = false;
+            ep.padding_idx = -1;
 
             tables_vec[op_idx] = tbl_data + o * table_outer_stride;
             indices_ptrs[op_idx] = idx.flat<T_indices>().data();
-            dst_ptrs[op_idx] = out_data + o * output_row_features +
-                               output_col_offset + g * per_index_features;
+            dst_ptrs[op_idx] =
+                out_data + o * output_row_features + gather_col_offset[j];
             params[op_idx] = ep;
           }
         }
 
-        output_col_offset += num_gathers * per_index_features;
         idx_cursor += num_gathers;
         op_cursor += outer_size * num_gathers;
       }

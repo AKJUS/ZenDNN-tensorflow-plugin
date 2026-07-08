@@ -3592,14 +3592,13 @@ Status AddFusedBatchMatMul(RemapperContext* ctx,
   return OkStatus();
 }
 
-// Try to match a single ConcatV2 input as a GatherV2 wrapped in one or more
-// SafeCast layers and an optional Cast.  Direct GatherV2 → ConcatV2 (without
-// any SafeCast/Cast) is rejected to avoid breaking models that don't benefit
-// from fusion (e.g., DIEN).
+// Try to match a single ConcatV2 input as a GatherV2 wrapped in zero or more
+// SafeCast layers and an optional Cast.
 //
 // Supported patterns (all feed into ConcatV2):
 //   BF16:  SelectV2(IsInf(Cast(GatherV2)), ZerosLike, Cast)
 //   FP32:  SelectV2(IsInf(SelectV2(IsInf(GatherV2),..)),..,..)  (stacked)
+//   Direct: GatherV2
 //
 // On success, sets table_name, index_name, gather_axis and appends
 // intermediate node indices to remove_indices.
@@ -3659,15 +3658,46 @@ bool MatchGatherInput(const RemapperContext& ctx,
 
   if (!IsGather(*cur_view->node())) return false;
 
-  // Require at least one intermediate layer (SafeCast or Cast) between
-  // GatherV2 and ConcatV2.  Direct GatherV2 → ConcatV2 has no overhead
-  // to eliminate and fusing it can break models (e.g., DIEN).
-  if (depth == 0) return false;
-
   const auto* gather_view = cur_view;
   const auto* gather_def = gather_view->node();
 
   if (gather_view->NumRegularFanins() < 3) return false;
+
+  // Direct GatherV2 → ConcatV2 (depth == 0) is only safe when the kernel can
+  // produce the correct output shape. The current kernel always emits rank-2
+  // output [outer_size, features], which matches const rank-≤1 index patterns
+  // (e.g., swipe_l1's sequential const indices). It CANNOT represent standard
+  // embedding lookups (dynamic multi-dim indices, gather_axis=0, output rank
+  // = indices_rank + 1), e.g., DIEN's [batch,seq] placeholders →
+  // [batch,seq,emb]. Wrapped paths (depth > 0, SafeCast/Cast) remain
+  // unrestricted (those are the original working BF16/FP32 embedding fusion
+  // cases).
+  if (depth == 0) {
+    const auto* indices_view = gather_view->GetRegularFanin(1).node_view();
+    const auto* indices_def = indices_view->node();
+
+    // Reject dynamic indices (non-Const).
+    if (!IsConstant(*indices_def)) {
+      zendnnl::error_handling::apilog_info(
+          "MatchGatherInput: rejected direct GatherV2→ConcatV2 with dynamic "
+          "indices (",
+          indices_def->op(), " ", indices_def->name(), ")");
+      return false;
+    }
+
+    // Reject Const indices with rank > 1 (multi-dim).
+    if (indices_def->attr().count("value")) {
+      const auto& tensor_proto = indices_def->attr().at("value").tensor();
+      const int indices_rank = tensor_proto.tensor_shape().dim_size();
+      if (indices_rank > 1) {
+        zendnnl::error_handling::apilog_info(
+            "MatchGatherInput: rejected direct GatherV2→ConcatV2 with "
+            "multi-dim Const indices (rank=",
+            indices_rank, ")");
+        return false;
+      }
+    }
+  }
 
   const auto* axis_view = gather_view->GetRegularFanin(2).node_view();
   const auto* axis_def = axis_view->node();
