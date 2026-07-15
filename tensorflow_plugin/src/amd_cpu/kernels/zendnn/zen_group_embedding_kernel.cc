@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <string>
 #include <vector>
 
 // TensorFlow plug-in headers.
@@ -38,8 +39,39 @@ namespace amd_cpu_plugin {
 
 namespace {
 
+// Fused post-ops applied, in order, to the gathered output. These generalize
+// the previous hardcoded SafeCast clamp so the kernel can compute (not just
+// skip) the ops the remapper fuses between GatherV2 and ConcatV2. Only the ops
+// actually observed on the data path today are handled; add a new value here
+// (plus a ParsePostOp token and an ApplyPostOps case) to support more.
+enum class PostOp {
+  kIdentity,  // no-op sentinel: the op-def default when the fused chain is
+              // empty (direct GatherV2->ConcatV2, no post-ops).
+  kSafeCast,  // SelectV2(IsInf(x), 0, x): clamp infinities to zero.
+};
+
+// Parse a fused-op token into a PostOp. Tokens are the semantic post-op names
+// emitted by the remapper plus the "Identity" no-op sentinel used as the op-def
+// default. "SafeCastCheck" denotes the SafeCast idiom (SelectV2(IsInf(x), 0,
+// x))
+// -- the remapper emits it only after verifying that exact shape, so it maps to
+// the clamp branch. Note: fused Cast layers are NOT emitted as tokens -- their
+// dtype conversion is already applied by the gather copy's
+// static_cast<T_output> (output dtype comes from the T_output attr), so they
+// need no post-op here. Returns false for unrecognized tokens.
+inline bool ParsePostOp(const string& name, PostOp* out) {
+  if (name == "SafeCastCheck") {
+    *out = PostOp::kSafeCast;
+  } else if (name == "Identity") {
+    *out = PostOp::kIdentity;
+  } else {
+    return false;
+  }
+  return true;
+}
+
 // SafeCast post-processing: clamp bf16 infinities to zero.
-inline void ClampBf16Infinities(Eigen::bfloat16* data, int64_t count) {
+inline void ClampInfinities(Eigen::bfloat16* data, int64_t count) {
   for (int64_t i = 0; i < count; ++i) {
     if (std::isinf(static_cast<float>(data[i]))) {
       data[i] = Eigen::bfloat16(0.0f);
@@ -47,8 +79,8 @@ inline void ClampBf16Infinities(Eigen::bfloat16* data, int64_t count) {
   }
 }
 
-inline void ClampBf16Infinities(float*, int64_t) {
-  // No-op for float output — SafeCast only needed for bf16.
+inline void ClampInfinities(float*, int64_t) {
+  // No-op for float output — SafeCast clamp only needed for bf16.
 }
 
 }  // namespace
@@ -83,6 +115,24 @@ class ZenGroupEmbeddingOp : public OpKernel {
                 errors::InvalidArgument(
                     "_ZenGroupEmbedding: num_passthrough must be 0 or 1, got ",
                     num_passthrough_));
+
+    // Parse the fused elementwise post-op chain from the "fused_ops" attribute.
+    // The remapper sets explicit tokens (e.g. a SafeCast clamp) when the chain
+    // is non-empty; for a direct GatherV2->ConcatV2 fusion it leaves the
+    // attribute unset, so the op-def default ["Identity"] (a single no-op)
+    // applies. The default is intentionally non-empty because the plugin's
+    // GetAttr<vector<string>> cannot read an empty list(string). Any read
+    // failure is surfaced rather than silently masked.
+    std::vector<string> fused_ops_str;
+    OP_REQUIRES_OK(context, context->GetAttr("fused_ops", &fused_ops_str));
+    for (const string& name : fused_ops_str) {
+      PostOp op;
+      OP_REQUIRES(
+          context, ParsePostOp(name, &op),
+          errors::InvalidArgument("_ZenGroupEmbedding: unrecognized fused op '",
+                                  name, "'"));
+      post_ops_.push_back(op);
+    }
   }
 
   void Compute(OpKernelContext* context) override {
@@ -351,7 +401,7 @@ class ZenGroupEmbeddingOp : public OpKernel {
       }
     }
 
-    ClampBf16Infinities(out_data, output->NumElements());
+    ApplyPostOps(out_data, output->NumElements());
 
     zendnnl::error_handling::apilog_info(
         "_ZenGroupEmbedding Compute completed: output_shape=",
@@ -360,12 +410,28 @@ class ZenGroupEmbeddingOp : public OpKernel {
   }
 
  private:
+  // Apply the fused post-op chain to the output buffer, in order.
+  void ApplyPostOps(T_output* data, int64_t count) {
+    for (PostOp op : post_ops_) {
+      switch (op) {
+        case PostOp::kIdentity:
+          // No-op sentinel (empty fused chain / direct fusion).
+          break;
+        case PostOp::kSafeCast:
+          // Clamp infinities to zero (no-op for fp32 output).
+          ClampInfinities(data, count);
+          break;
+      }
+    }
+  }
+
   int num_tables_ = 1;
   int num_lookups_ = 0;
   int embedding_dim_ = -1;
   int gather_axis_ = 0;
   int num_passthrough_ = 0;
   std::vector<int> gathers_per_table_;
+  std::vector<PostOp> post_ops_;
 };
 
 #define REGISTER_GROUP_EMBEDDING_KERNEL(T_table, T_indices, T_output) \

@@ -47,6 +47,20 @@ void RegisterZenGroupEmbedding() {
   TF_OpDefinitionBuilderAddAttr(op_builder, "embedding_dim: int = -1");
   TF_OpDefinitionBuilderAddAttr(op_builder, "gather_axis: int = 0");
   TF_OpDefinitionBuilderAddAttr(op_builder, "gathers_per_table: list(int)");
+  // Ordered list of fused post-ops applied to the gathered output, in kernel
+  // order (gather-side op first). Tokens are the semantic post-op names emitted
+  // by the remapper. Recognized tokens: "SafeCastCheck" (the SafeCast idiom
+  // SelectV2(IsInf(x), 0, x)) and "Identity" (no-op sentinel). Fused Cast
+  // layers are not emitted as tokens -- their dtype conversion is folded into
+  // the kernel's gather copy (output dtype comes from the T_output attr).
+  //
+  // The default is the single no-op token ["Identity"], NOT an empty list: the
+  // remapper leaves this attribute unset for a direct GatherV2->ConcatV2 fusion
+  // (no post-ops), and the kernel must be able to read the resulting value. The
+  // plugin's GetAttr<vector<string>> cannot read an empty list(string), so a
+  // non-empty no-op default is used to represent "no post-ops" safely.
+  TF_OpDefinitionBuilderAddAttr(op_builder,
+                                "fused_ops: list(string) = ['Identity']");
   // TODO (plugin): Implement proper shape inference
   // Output shape is deterministic: [outer_dims..., total_features]
   // where total_features = sum(gathers_per_table[i] * num_indices *

@@ -374,6 +374,11 @@ struct GroupEmbedding {
   // When true, ALL ConcatV2 inputs matched and the entire ConcatV2 is
   // replaced by a single multi-table _ZenGroupEmbedding node.
   bool full_fusion = false;
+  // Ordered elementwise post-op chain fused between each GatherV2 and the
+  // ConcatV2, in KERNEL order (innermost/gather-side op first). The chain is
+  // uniform across all inputs of the ConcatV2; captured from the first input.
+  // Consumed by the _ZenGroupEmbedding kernel via the "fused_ops" attribute.
+  std::vector<std::string> fused_ops;
 };
 
 bool IsAddWithNoBroadcast(const RemapperContext& ctx, const NodeDef& node) {
@@ -3593,25 +3598,47 @@ Status AddFusedBatchMatMul(RemapperContext* ctx,
 }
 
 // Try to match a single ConcatV2 input as a GatherV2 wrapped in zero or more
-// SafeCast layers and an optional Cast.
+// SafeCast layers.
 //
 // Supported patterns (all feed into ConcatV2):
 //   BF16:  SelectV2(IsInf(Cast(GatherV2)), ZerosLike, Cast)
 //   FP32:  SelectV2(IsInf(SelectV2(IsInf(GatherV2),..)),..,..)  (stacked)
 //   Direct: GatherV2
 //
+// In the BF16 pattern the Cast is the SafeCast's else-input (and the IsInf
+// input); it is unwrapped as part of the SafeCast, not as an independent layer.
+// A Cast is therefore only accepted inside a verified SafeCast, so a bare
+// GatherV2 -> Cast -> ConcatV2 is not matched.
+//
 // On success, sets table_name, index_name, gather_axis and appends
-// intermediate node indices to remove_indices.
+// intermediate node indices to remove_indices. If op_tokens is non-null, it is
+// filled with the semantic post-op names in KERNEL order (gather-side op
+// first), e.g. {"SafeCastCheck"} for GatherV2 -> Cast -> SelectV2(SafeCast
+// idiom) -> ConcatV2. The fused Cast is deleted but not emitted as a token (its
+// dtype conversion is folded into the kernel's gather copy), so a direct
+// GatherV2 yields an empty token list.
 bool MatchGatherInput(const RemapperContext& ctx,
                       const utils::MutableNodeView* inp_view,
                       std::string* table_name, std::string* index_name,
-                      int* gather_axis, std::vector<int>* remove_indices) {
+                      int* gather_axis, std::vector<int>* remove_indices,
+                      std::vector<std::string>* op_tokens = nullptr) {
   const auto* cur_view = inp_view;
+  // Collected outermost->innermost (ConcatV2 side first); reversed before
+  // returning so the caller receives kernel order (gather side first).
+  std::vector<std::string> walk_tokens;
 
-  // Iteratively unwrap SafeCast layers:
+  // Iteratively unwrap SafeCast layers until we reach the GatherV2:
   //   SelectV2(IsInf(X), ZerosLike(X), X) → unwrap to X
-  // and optional Cast layers.
-  constexpr int kMaxUnwrapDepth = 4;
+  // where X is either the next SafeCast (stacked FP32), the GatherV2, or - in
+  // the BF16 pattern - a Cast wrapping the GatherV2, which is peeled within the
+  // same iteration.
+  //
+  // Each loop iteration peels one SafeCast layer. We cap the walk with a
+  // bounded limit rather than looping unbounded: in production the number of
+  // layers is small and a hard cap protects against walking a
+  // pathological/malformed graph. The cap is sized to allow up to 4 stacked
+  // SafeCast layers with comfortable headroom.
+  constexpr int kMaxUnwrapDepth = 20;
   int depth = 0;
   for (depth = 0; depth < kMaxUnwrapDepth; ++depth) {
     const auto* cur_def = cur_view->node();
@@ -3634,22 +3661,35 @@ bool MatchGatherInput(const RemapperContext& ctx,
       remove_indices->push_back(cur_view->node_index());
       remove_indices->push_back(cond_view->node_index());
       remove_indices->push_back(then_view->node_index());
+      // Emit the semantic token "SafeCastCheck". This node represents the
+      // SafeCast (clamp-infinities-to-zero) idiom.
+      walk_tokens.push_back("SafeCastCheck");
 
       cur_view = else_view;
-      continue;
-    }
 
-    if (IsCast(*cur_def)) {
-      remove_indices->push_back(cur_view->node_index());
-      if (cur_view->NumRegularFanins() < 1) return false;
-      cur_view = cur_view->GetRegularFanin(0).node_view();
+      // BF16 pattern: the SafeCast wraps a Cast
+      //   SelectV2(IsInf(Cast(GatherV2)), ZerosLike, Cast(GatherV2))
+      // i.e. the SafeCast's else-input (== the IsInf input, verified above) is
+      // a Cast. Unwrap that Cast here as part of the SafeCast: it needs no
+      // post-op token because its dtype conversion is folded into the kernel's
+      // gather copy (static_cast<T_output>, output dtype captured in the
+      // T_output attr). The node is still recorded for deletion. In FP32 the
+      // else-input is the next SelectV2 (stacked) or the GatherV2 directly (no
+      // Cast).
+      if (IsCast(*else_view->node())) {
+        remove_indices->push_back(else_view->node_index());
+        if (else_view->NumRegularFanins() < 1) return false;
+        cur_view = else_view->GetRegularFanin(0).node_view();
+      }
       continue;
     }
 
     break;
   }
 
-  // Log warning if we hit the unwrap depth limit without finding a gather
+  // If we exhausted the depth budget without reaching a GatherV2, the chain is
+  // deeper than we support (or malformed); log and bail so the caller can skip
+  // fusing this input.
   if (depth == kMaxUnwrapDepth && !IsGather(*cur_view->node())) {
     zendnnl::error_handling::apilog_info(
         "MatchGatherInput: hit unwrap depth limit at ", cur_view->node()->op(),
@@ -3718,6 +3758,11 @@ bool MatchGatherInput(const RemapperContext& ctx,
   *index_name = gather_def->input(1);
   *gather_axis = axis_val;
   remove_indices->push_back(gather_view->node_index());
+
+  if (op_tokens != nullptr) {
+    // Reverse to kernel order: gather-side op applied first.
+    op_tokens->assign(walk_tokens.rbegin(), walk_tokens.rend());
+  }
   return true;
 }
 
@@ -3750,6 +3795,7 @@ bool FindGroupEmbedding(const RemapperContext& ctx, int node_index,
     std::string index_name;
     int axis_val;
     std::vector<int> remove_indices;
+    std::vector<std::string> op_tokens;
   };
   std::vector<GatherInfo> all_gathers(n_values);
   bool all_match = true;
@@ -3766,7 +3812,8 @@ bool FindGroupEmbedding(const RemapperContext& ctx, int node_index,
 
     bool ok = MatchGatherInput(
         ctx, inp_view, &all_gathers[v].table_name, &all_gathers[v].index_name,
-        &all_gathers[v].axis_val, &all_gathers[v].remove_indices);
+        &all_gathers[v].axis_val, &all_gathers[v].remove_indices,
+        &all_gathers[v].op_tokens);
     if (!ok) {
       zendnnl::error_handling::apilog_info(
           "Remapper: full-fusion check failed at input ", v, " of ", n_values,
@@ -3819,6 +3866,8 @@ bool FindGroupEmbedding(const RemapperContext& ctx, int node_index,
     matched->concat = node_index;
     matched->runs = std::move(runs);
     matched->full_fusion = true;
+    // Chain is uniform across inputs; capture it from the first input.
+    matched->fused_ops = all_gathers[0].op_tokens;
 
     zendnnl::error_handling::apilog_info(
         "Remapper: Found full-fusion GroupEmbedding with ",
@@ -3841,9 +3890,14 @@ bool FindGroupEmbedding(const RemapperContext& ctx, int node_index,
     std::string table_name, index_name;
     int axis_val = 0;
     std::vector<int> remove_indices;
+    std::vector<std::string> op_tokens;
 
     bool is_match = MatchGatherInput(ctx, inp_view, &table_name, &index_name,
-                                     &axis_val, &remove_indices);
+                                     &axis_val, &remove_indices, &op_tokens);
+    if (is_match && matched->fused_ops.empty()) {
+      // Chain is uniform; capture from the first matched input.
+      matched->fused_ops = op_tokens;
+    }
 
     if (is_match && in_run && table_name == current_run.table_name &&
         axis_val == current_run.gather_axis) {
@@ -4015,6 +4069,12 @@ Status AddFullFusionGroupEmbeddingNode(RemapperContext* ctx,
   SetAttrValue(-1, &(*attr)["embedding_dim"]);
   SetAttrValue(matched.runs[0].gather_axis, &(*attr)["gather_axis"]);
   SetAttrValue(gathers_per_table, &(*attr)["gathers_per_table"]);
+  // Only emit fused_ops when there is at least one post-op. An empty list would
+  // leave the kernel reading an empty list(string) attribute, which the op-def
+  // default ([]) already represents as "no post-ops".
+  if (!matched.fused_ops.empty()) {
+    SetAttrValue(matched.fused_ops, &(*attr)["fused_ops"]);
+  }
 
   utils::Mutation* mutation = ctx->graph_view.GetMutationBuilder();
   Status status;
@@ -4169,6 +4229,12 @@ Status AddMultiTableGroupEmbeddingNode(RemapperContext* ctx,
                  &(*attr)["gather_axis"]);
     SetAttrValue(gathers_per_table, &(*attr)["gathers_per_table"]);
     SetAttrValue(block_has_pt ? 1 : 0, &(*attr)["num_passthrough"]);
+    // Only emit fused_ops when there is at least one post-op. An empty list
+    // would leave the kernel reading an empty list(string) attribute, which
+    // the op-def default ([]) already represents as "no post-ops".
+    if (!matched.fused_ops.empty()) {
+      SetAttrValue(matched.fused_ops, &(*attr)["fused_ops"]);
+    }
 
     mutation->AddNode(std::move(emb_node), &status);
     TF_RETURN_IF_ERROR(status);
