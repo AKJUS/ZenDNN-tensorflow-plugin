@@ -64,6 +64,8 @@ const std::vector<ZenFormatInfo>* GetZenFormatInfo() {
       //  RewriteSupportedDataType},
       {"Softmax", "_ZenSoftmax", CopyAttrsAll, RewriteSupportedDataType},
       {"Einsum", "_ZenEinsum", CopyAttrsZenEinsum, RewriteEinsum},
+      {"_FusedLayerNorm", "_ZenFusedLayerNorm", CopyAttrsAll,
+       RewriteSupportedDataType},
   };
   return &rinfo;
 }

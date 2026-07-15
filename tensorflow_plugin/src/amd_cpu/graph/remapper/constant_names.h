@@ -78,6 +78,7 @@ constexpr char kFusedBatchNormEx[] = "_FusedBatchNormEx";
 constexpr char kFusedConv2D[] = "_FusedConv2D";
 constexpr char kFusedDepthwiseConv2dNative[] = "_FusedDepthwiseConv2dNative";
 constexpr char kFusedMatMul[] = "_FusedMatMul";
+constexpr char kFusedLayerNorm[] = "_FusedLayerNorm";
 
 // Misc constant names.
 constexpr int kMissingIndex = -1;

@@ -63,6 +63,21 @@ cc_library(
 )
 
 cc_library(
+    name = "zen_fused_layernorm_op",
+    srcs = ["zen_fused_layernorm_op.cc"],
+    copts = tf_copts(),
+    linkstatic = 1,
+    visibility = ["//visibility:public"],
+    deps = [
+        ":shape_inference_fns",
+        "//tensorflow_plugin/src/amd_cpu/util:common_utils",
+        "@local_config_tf//:tf_header_lib",
+        "@zendnnl_repo//:zendnnl_lib",
+    ],
+    alwayslink = True,
+)
+
+cc_library(
     name = "zen_softmax_op",
     srcs = ["zen_softmax_op.cc"],
     copts = tf_copts(),
@@ -147,6 +162,7 @@ ZEN_OPS = [
     ":zen_group_embedding_op",
     ":zen_embedding_lookup_sparse_op",
     ":zen_einsum_ops",
+    ":zen_fused_layernorm_op",
 ]
 
 cc_library(

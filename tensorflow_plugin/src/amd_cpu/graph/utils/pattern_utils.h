@@ -222,12 +222,19 @@ class SubGraphMatcher {
 
   // If a given pattern is matched, this function returns true as well as the
   // matched node and remove node info is populated.
+  // When non-null, *matched_pattern_but_unsafe_to_remove is set to true iff
+  // DoesOpTypePatternMatch succeeded but IsSafeNodesToRemove failed (external
+  // data fanout from a node slated for removal). On pattern mismatch it is set
+  // to false. When null, the parameter is ignored.
   bool GetMatchedNodes(const OpTypePattern& pattern,
                        const std::unordered_set<string>& nodes_to_preserve,
                        MutableNodeView* node_view,
                        std::map<string, int>* matched_nodes_map,
                        std::set<int>* remove_node_indices,
-                       bool fanin_checking = true);
+                       bool fanin_checking = true,
+                       bool ignore_controlled_fanouts = false,
+                       bool ignore_controlling_fanins = false,
+                       bool* matched_pattern_but_unsafe_to_remove = nullptr);
 
  private:
   MutableGraphView* graph_view_;
@@ -238,7 +245,9 @@ class SubGraphMatcher {
 
   bool DoesOpTypePatternMatch(const OpTypePattern& pattern,
                               MutableNodeView* node_view, NodeViewMatch* match,
-                              bool fanin_checking = true);
+                              bool fanin_checking = true,
+                              bool ignore_controlled_fanouts = false,
+                              bool ignore_controlling_fanins = false);
 
   // This function should be called after the pattern matcher has found
   // potential matched nodes (i.e. when DoesOpTypePatternMatch returns "true").
@@ -250,20 +259,46 @@ class SubGraphMatcher {
       auto node_view = graph_view_->GetNode(node_idx);
       // Check if the node to be removed is in the nodes to be preserved.
       string node_name = node_view->GetName();
-      if (nodes_to_preserve.count(node_name) > 0) return false;
+      if (nodes_to_preserve.count(node_name) > 0) {
+        zendnnl::error_handling::apilog_info(
+            "Pattern: fusion blocked: remove-node ", node_name, " (",
+            node_view->node()->op(), ") is listed in nodes_to_preserve");
+        return false;
+      }
       // Traverse all the Regular Fanouts. Fanouts are stored as vector of
       // vector, std::vector<std::vector<MutableFaninView>>. Note that
-      // a MutableNodeView's fanouts are stored in a nested vector of
+      // a MutableNodeView's fanouts are stored as a nested vector of
       // MutableFaninView type.
       auto fanouts_by_ports = node_view->GetRegularFanouts();
-      for (const auto& fanouts : fanouts_by_ports) {
-        for (const auto& fanout : fanouts) {
+      int leak_count = 0;
+      for (int out_port = 0;
+           out_port < static_cast<int>(fanouts_by_ports.size()); ++out_port) {
+        for (const auto& fanout : fanouts_by_ports[out_port]) {
           if (!matched_node_indices_.count(fanout.node_index())) {
+            ++leak_count;
+            auto* consumer_view = graph_view_->GetNode(fanout.node_index());
+            const string consumer_name = consumer_view && consumer_view->node()
+                                             ? consumer_view->node()->name()
+                                             : string("?");
+            const string consumer_op = consumer_view && consumer_view->node()
+                                           ? consumer_view->node()->op()
+                                           : string("?");
+            // producer:out_port -> consumer:in_port identifies the exact graph
+            // edge that leaves the matched fusion subgraph.
             zendnnl::error_handling::apilog_info(
-                "Pattern: Node has unmatched fanout, not safe to remove");
-            return false;
+                "Pattern: fusion leak edge producer=", node_name,
+                " op=", node_view->node()->op(), " out_port=", out_port,
+                " -> consumer=", consumer_name, " op=", consumer_op,
+                " in_port=", fanout.index(),
+                " (consumer not in matched subgraph; cannot remove producer)");
           }
         }
+      }
+      if (leak_count > 0) {
+        zendnnl::error_handling::apilog_info(
+            "Pattern: IsSafeNodesToRemove=false: ", leak_count,
+            " leak edge(s) from remove-node ", node_name);
+        return false;
       }
     }
     return true;

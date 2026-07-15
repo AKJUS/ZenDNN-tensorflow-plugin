@@ -49,6 +49,23 @@ cc_library(
 )
 
 cc_library(
+    name = "zen_fused_layernorm_kernel",
+    srcs = ["zen_fused_layernorm_kernel.cc"],
+    hdrs = ["zen_zendnnl_utils.h"],
+    copts = tf_copts(),
+    linkstatic = 1,
+    visibility = ["//visibility:public"],
+    deps = [
+        ":zen_kernel_common",
+        ":zen_zendnnl_utils",
+        "//tensorflow_plugin/src/amd_cpu/util:common_utils",
+        "@local_config_tf//:tf_header_lib",
+        "@zendnnl_repo//:zendnnl_lib",
+    ],
+    alwayslink = True,
+)
+
+cc_library(
     name = "zen_softmax_kernel",
     srcs = ["zen_softmax_kernel.cc"],
     hdrs = ["zen_zendnnl_utils.h"],
@@ -219,6 +236,7 @@ cc_library(
 )
 
 ZEN_KERNELS = [
+    ":zen_fused_layernorm_kernel",
     ":zen_softmax_kernel",
     ":zen_conv2d_kernel",
     ":zen_matmul_kernels",

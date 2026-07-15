@@ -34,6 +34,9 @@ limitations under the License.
 #include "tensorflow_plugin/src/amd_cpu/graph/utils/op_types.h"
 #include "tensorflow_plugin/src/amd_cpu/graph/utils/pattern_utils.h"
 #include "tensorflow_plugin/src/amd_cpu/graph/utils/symbolic_shapes.h"
+#include "tensorflow_plugin/src/amd_cpu/util/node_def_util.h"
+#include "tensorflow_plugin/src/amd_cpu/util/strcat.h"
+#include "tensorflow_plugin/src/amd_cpu/util/tensor_id.h"
 // ZenDNNL logging support
 #include "common/zendnnl_global.hpp"
 
@@ -6286,6 +6289,360 @@ Status AddFuseMatmulBNfold(RemapperContext* ctx,
 
   return OkStatus();
 }
+//------------------------------------------------------------------------------
+// Expanded LayerNorm fusion.
+//------------------------------------------------------------------------------
+
+int ResolveNodeDataSourceIndex(utils::MutableNodeView* v) {
+  for (int depth = 0; depth < 16 && v != nullptr; ++depth) {
+    const string& op = v->node()->op();
+    if ((op == "Identity" || op == "StopGradient" || op == kCast) &&
+        v->NumRegularFanins() >= 1) {
+      v = v->GetRegularFanin(0).node_view();
+      continue;
+    }
+    break;
+  }
+  return v != nullptr ? v->node_index() : -1;
+}
+
+bool GetScalarFloatFromConstNode(const NodeDef* node_def, float* out) {
+  if (node_def == nullptr || node_def->op() != "Const") return false;
+  Tensor t;
+  if (!GetTensorFromConstant(node_def, &t).ok() || t.NumElements() != 1) {
+    return false;
+  }
+  if (t.dtype() == DT_FLOAT) {
+    *out = t.flat<float>()(0);
+    return true;
+  }
+  if (t.dtype() == DT_BFLOAT16) {
+    *out = static_cast<float>(t.flat<Eigen::bfloat16>()(0));
+    return true;
+  }
+  return false;
+}
+
+bool ExtractEpsilonFromAddEps(RemapperContext* ctx, int add_eps_idx,
+                              float* eps) {
+  auto* add_view = ctx->graph_view.GetNode(add_eps_idx);
+  if (add_view->NumRegularFanins() < 2) return false;
+  for (int i = 0; i < 2; ++i) {
+    auto* fin = add_view->GetRegularFanin(i).node_view();
+    if (IsMean(*fin->node())) continue;
+    int src = ResolveNodeDataSourceIndex(fin);
+    if (src >= 0 && GetScalarFloatFromConstNode(
+                        ctx->graph_view.GetNode(src)->node(), eps)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool GetMeanReductionAxes(RemapperContext* ctx, int mean_idx,
+                          std::vector<int32>* axes) {
+  auto* mean_view = ctx->graph_view.GetNode(mean_idx);
+  if (mean_view->NumRegularFanins() < 2) return false;
+  int axes_idx =
+      ResolveNodeDataSourceIndex(mean_view->GetRegularFanin(1).node_view());
+  if (axes_idx < 0) return false;
+  const NodeDef* axes_node = ctx->graph_view.GetNode(axes_idx)->node();
+  if (axes_node->op() != "Const") return false;
+  Tensor t;
+  if (!GetTensorFromConstant(axes_node, &t).ok()) return false;
+  axes->clear();
+  if (t.dtype() == DT_INT32) {
+    auto e = t.flat<int32>();
+    for (int i = 0; i < e.size(); ++i) axes->push_back(e(i));
+  } else if (t.dtype() == DT_INT64) {
+    auto e = t.flat<int64_t>();
+    for (int i = 0; i < e.size(); ++i) {
+      axes->push_back(static_cast<int32>(e(i)));
+    }
+  } else {
+    return false;
+  }
+  return !axes->empty();
+}
+
+utils::OpTypePattern MakeLayerNormScaleSubtree() {
+  using utils::NodeStatus;
+  utils::OpTypePattern mean_mu = {"Mean", "mean_mu", NodeStatus::kRemove, {}};
+  mean_mu.AddInput({"*", "input", NodeStatus::kRemain});
+  mean_mu.AddInput({"*", "axes_mu", NodeStatus::kRemain});
+
+  utils::OpTypePattern sqdiff = {
+      "SquaredDifference", "sqdiff", NodeStatus::kRemove, {}};
+  sqdiff.AddInput({"*", "input", NodeStatus::kRemain});
+  sqdiff.AddInput(mean_mu);
+
+  utils::OpTypePattern mean_var = {"Mean", "mean_var", NodeStatus::kRemove, {}};
+  mean_var.AddInput(sqdiff);
+  mean_var.AddInput({"*", "axes_var", NodeStatus::kRemain});
+
+  utils::OpTypePattern add_eps = {
+      "AddV2|Add", "add_eps", NodeStatus::kRemove, {}};
+  add_eps.AddInput(mean_var);
+  add_eps.AddInput({"*", "epsilon", NodeStatus::kRemain});
+
+  utils::OpTypePattern rsqrt = {"Rsqrt", "rsqrt", NodeStatus::kRemove, {}};
+  rsqrt.AddInput(add_eps);
+
+  utils::OpTypePattern scale = {"Mul", "scale", NodeStatus::kRemove, {}};
+  scale.AddInput({"*", "gamma", NodeStatus::kRemain});
+  scale.AddInput(rsqrt);
+  return scale;
+}
+
+std::pair<utils::OpTypePattern, utils::OpTypePattern>
+MakeLayerNormSubMulBranches(const utils::OpTypePattern& scale) {
+  using utils::NodeStatus;
+  utils::OpTypePattern mul_x = {"Mul", "mul_x", NodeStatus::kRemove, {}};
+  mul_x.AddInput({"*", "input", NodeStatus::kRemain});
+  mul_x.AddInput(scale);
+
+  utils::OpTypePattern mul_mu = {"Mul", "mul_mu", NodeStatus::kRemove, {}};
+  utils::OpTypePattern mean_mu = {"Mean", "mean_mu", NodeStatus::kRemove, {}};
+  mean_mu.AddInput({"*", "input", NodeStatus::kRemain});
+  mean_mu.AddInput({"*", "axes_mu", NodeStatus::kRemain});
+  mul_mu.AddInput(mean_mu);
+  mul_mu.AddInput(scale);
+
+  utils::OpTypePattern sub = {"Sub", "sub", NodeStatus::kRemove, {}};
+  sub.AddInput({"*", "beta", NodeStatus::kRemain});
+  sub.AddInput(mul_mu);
+  return {sub, mul_x};
+}
+
+bool FindFusedLayerNorm(RemapperContext* ctx, int node_index,
+                        std::map<string, int>* matched_nodes_map,
+                        std::set<int>* remove_node_indices,
+                        bool* matched_residual_out) {
+  using utils::MatchingDirection;
+  using utils::NodeStatus;
+
+  const auto validate_matched = [&](RemapperContext* c,
+                                    const std::map<string, int>& matched,
+                                    bool with_residual_addn) -> bool {
+    auto* sub_view = c->graph_view.GetNode(matched.at("sub"));
+    const int ds_sub0 =
+        ResolveNodeDataSourceIndex(sub_view->GetRegularFanin(0).node_view());
+    const int ds_sub1 =
+        ResolveNodeDataSourceIndex(sub_view->GetRegularFanin(1).node_view());
+    const int ds_beta =
+        ResolveNodeDataSourceIndex(c->graph_view.GetNode(matched.at("beta")));
+    const int ds_mul_mu =
+        ResolveNodeDataSourceIndex(c->graph_view.GetNode(matched.at("mul_mu")));
+    if (ds_sub0 != ds_beta || ds_sub1 != ds_mul_mu) return false;
+
+    std::vector<int32> axes_mu, axes_var;
+    if (!GetMeanReductionAxes(c, matched.at("mean_mu"), &axes_mu) ||
+        !GetMeanReductionAxes(c, matched.at("mean_var"), &axes_var) ||
+        axes_mu != axes_var) {
+      return false;
+    }
+
+    float eps = 0.f;
+    if (!ExtractEpsilonFromAddEps(c, matched.at("add_eps"), &eps) ||
+        eps <= 0.f) {
+      return false;
+    }
+
+    const NodeDef* input_node =
+        c->graph_view.GetNode(matched.at("input"))->node();
+    DataType input_type = GetDataTypeFromAttr(*input_node, "T");
+    if (input_type == DT_INVALID) {
+      input_type = GetDataTypeFromAttr(*input_node, "dtype");
+    }
+    if (input_type != DT_FLOAT && input_type != DT_BFLOAT16) return false;
+
+    if (!with_residual_addn) return true;
+
+    const int residual_ds = ResolveNodeDataSourceIndex(
+        c->graph_view.GetNode(matched.at("residual_in")));
+    auto* out_view = c->graph_view.GetNode(matched.at("output"));
+    int residual_fanin_matches = 0;
+    for (int p = 0; p < 3; ++p) {
+      if (ResolveNodeDataSourceIndex(
+              out_view->GetRegularFanin(p).node_view()) == residual_ds) {
+        residual_fanin_matches++;
+      }
+    }
+    return residual_fanin_matches == 1;
+  };
+
+  utils::MutableNodeView* node_view = ctx->graph_view.GetNode(node_index);
+  const NodeDef* node_def = node_view->node();
+  if (HasControlFaninOrFanout(*node_view)) return false;
+
+  const utils::OpTypePattern scale_subtree = MakeLayerNormScaleSubtree();
+  const auto [sub_branch, mul_x_branch] =
+      MakeLayerNormSubMulBranches(scale_subtree);
+
+  const std::vector<utils::OpTypePattern> two_input_patterns = {
+      {"AddN|AddV2|Add",
+       "output",
+       NodeStatus::kReplace,
+       {sub_branch, mul_x_branch}},
+      {"AddN|AddV2|Add",
+       "output",
+       NodeStatus::kReplace,
+       {mul_x_branch, sub_branch}},
+  };
+
+  std::vector<utils::OpTypePattern> residual_patterns;
+  residual_patterns.reserve(6);
+  static constexpr std::array<std::array<int, 3>, 6> kFaninOrders = {{
+      {0, 1, 2},
+      {0, 2, 1},
+      {1, 0, 2},
+      {1, 2, 0},
+      {2, 0, 1},
+      {2, 1, 0},
+  }};
+  utils::OpTypePattern residual_branch{
+      "*", "residual_in", NodeStatus::kRemain, {}};
+  for (const auto& ord : kFaninOrders) {
+    auto branches = MakeLayerNormSubMulBranches(scale_subtree);
+    const utils::OpTypePattern* fanins[3] = {&branches.first, &branches.second,
+                                             &residual_branch};
+    residual_patterns.push_back(
+        {"AddN",
+         "output",
+         NodeStatus::kReplace,
+         {*fanins[ord[0]], *fanins[ord[1]], *fanins[ord[2]]}});
+  }
+
+  const auto try_patterns =
+      [&](const std::vector<utils::OpTypePattern>& patterns,
+          bool with_residual) -> bool {
+    utils::SubGraphMatcher<MatchingDirection::kFollowInputs> matcher(
+        &(ctx->graph_view));
+    for (const auto& pattern : patterns) {
+      matched_nodes_map->clear();
+      remove_node_indices->clear();
+      if (matcher.GetMatchedNodes(pattern, ctx->nodes_to_preserve, node_view,
+                                  matched_nodes_map, remove_node_indices,
+                                  false) &&
+          validate_matched(ctx, *matched_nodes_map, with_residual)) {
+        if (matched_residual_out != nullptr) {
+          *matched_residual_out = with_residual;
+        }
+        return true;
+      }
+    }
+    return false;
+  };
+
+  if (IsAddN(*node_def) && node_view->NumRegularFanins() == 3) {
+    return try_patterns(residual_patterns, true);
+  }
+  if ((!IsAddN(*node_def) && node_def->op() != kAddV2 &&
+       !IsAddWithNoBroadcast(*ctx, *node_def)) ||
+      node_view->NumRegularFanins() != 2) {
+    return false;
+  }
+  return try_patterns(two_input_patterns, false);
+}
+
+Status AddFusedLayerNorm(RemapperContext* ctx,
+                         const std::map<string, int>& matched_nodes_map,
+                         const std::set<int>& remove_node_indices,
+                         std::vector<bool>* invalidated_nodes,
+                         std::vector<bool>* nodes_to_delete,
+                         bool with_residual) {
+  auto* output_view = ctx->graph_view.GetNode(matched_nodes_map.at("output"));
+  const NodeDef* output_node = output_view->node();
+  auto* mean_mu_view = ctx->graph_view.GetNode(matched_nodes_map.at("mean_mu"));
+  auto* scale_view = ctx->graph_view.GetNode(matched_nodes_map.at("scale"));
+  auto* sub_view = ctx->graph_view.GetNode(matched_nodes_map.at("sub"));
+
+  int res_port = -1;
+  if (with_residual) {
+    const int residual_ds = ResolveNodeDataSourceIndex(
+        ctx->graph_view.GetNode(matched_nodes_map.at("residual_in")));
+    for (int p = 0; p < 3; ++p) {
+      if (ResolveNodeDataSourceIndex(
+              output_view->GetRegularFanin(p).node_view()) == residual_ds) {
+        res_port = p;
+        break;
+      }
+    }
+    if (res_port < 0) {
+      return errors::Internal("FusedLayerNorm: residual fanin");
+    }
+  }
+
+  std::vector<int32> axes;
+  GetMeanReductionAxes(ctx, matched_nodes_map.at("mean_mu"), &axes);
+  float epsilon = 0.f;
+  ExtractEpsilonFromAddEps(ctx, matched_nodes_map.at("add_eps"), &epsilon);
+  const DataType t = GetDataTypeFromAttr(*mean_mu_view->node(), "T");
+
+  const string fused_name = with_residual
+                                ? output_node->name() + "/FusedLayerNorm"
+                                : output_node->name();
+
+  NodeDef fused_ln;
+  fused_ln.set_name(fused_name);
+  fused_ln.set_op(kFusedLayerNorm);
+  fused_ln.set_device(mean_mu_view->node()->device());
+  fused_ln.add_input(mean_mu_view->node()->input(0));
+
+  int gamma_in_port =
+      scale_view->GetRegularFanin(0).node_view()->node()->op() == "Rsqrt" ? 1
+                                                                          : 0;
+  fused_ln.add_input(scale_view->node()->input(gamma_in_port));
+
+  const int ds_beta = ResolveNodeDataSourceIndex(
+      ctx->graph_view.GetNode(matched_nodes_map.at("beta")));
+  const int ds_mul_mu = ResolveNodeDataSourceIndex(
+      ctx->graph_view.GetNode(matched_nodes_map.at("mul_mu")));
+  const int ds_s0 =
+      ResolveNodeDataSourceIndex(sub_view->GetRegularFanin(0).node_view());
+  const int ds_s1 =
+      ResolveNodeDataSourceIndex(sub_view->GetRegularFanin(1).node_view());
+  const int beta_in_port =
+      (ds_s0 == ds_beta && ds_s1 == ds_mul_mu)
+          ? 0
+          : (ds_s0 == ds_mul_mu && ds_s1 == ds_beta ? 1 : -1);
+  if (beta_in_port < 0) {
+    return errors::Internal("FusedLayerNorm: beta port");
+  }
+  fused_ln.add_input(sub_view->node()->input(beta_in_port));
+
+  AddNodeAttr("T", t, &fused_ln);
+  AddNodeAttr("epsilon", epsilon, &fused_ln);
+  AddNodeAttr("axes", axes, &fused_ln);
+
+  zendnnl::error_handling::apilog_info(
+      "Remapper: Fusing LayerNorm expanded subgraph (", output_node->name(),
+      ") into ", kFusedLayerNorm, with_residual ? " + AddV2" : "");
+
+  utils::Mutation* mutation = ctx->graph_view.GetMutationBuilder();
+  Status status;
+  mutation->AddNode(std::move(fused_ln), &status);
+  TF_RETURN_IF_ERROR(status);
+  if (with_residual) {
+    NodeDef add_res;
+    add_res.set_name(output_node->name());
+    add_res.set_op(kAddV2);
+    add_res.set_device(output_node->device());
+    add_res.add_input(fused_name);
+    add_res.add_input(output_node->input(res_port));
+    AddNodeAttr("T", t, &add_res);
+    mutation->AddNode(std::move(add_res), &status);
+    TF_RETURN_IF_ERROR(status);
+  }
+
+  TF_RETURN_IF_ERROR(mutation->Apply());
+  (*invalidated_nodes)[matched_nodes_map.at("output")] = true;
+  for (const auto& node_idx : remove_node_indices) {
+    (*nodes_to_delete)[node_idx] = true;
+  }
+  return OkStatus();
+}
+
 }  // namespace
 
 Status RunRemapper(const char* device_name, const GrapplerItem& item,
@@ -6361,6 +6718,9 @@ Status RunRemapper(const char* device_name, const GrapplerItem& item,
                                          node_def->name(), " (", node_def->op(),
                                          ")");
     {
+      std::map<string, int> matched_nodes_map;
+      std::set<int> remove_node_indices;
+
       // Horizontal fusion: GatherV2 x N -> [SafeCast] -> ConcatV2 =>
       // _ZenGroupEmbedding.
       GroupEmbedding group_embedding;
@@ -6535,8 +6895,8 @@ Status RunRemapper(const char* device_name, const GrapplerItem& item,
       }
 
       // Remap MatMul + BiasAdd + gelu-subgraph.
-      std::map<string, int> matched_nodes_map;
-      std::set<int> remove_node_indices;
+      matched_nodes_map.clear();
+      remove_node_indices.clear();
       bool is_gelu_approximate = false;
       bool expand_dims = false;
       if (FindMatMulBiasAddAndGelu(&ctx, i, &matched_nodes_map,
@@ -6547,6 +6907,22 @@ Status RunRemapper(const char* device_name, const GrapplerItem& item,
         TF_ABORT_IF_ERROR(AddFusedMatMulBiasAddAndGelu(
             &ctx, matched_nodes_map, remove_node_indices, &invalidated_nodes,
             &nodes_to_delete, is_gelu_approximate, expand_dims));
+        continue;
+      }
+
+      // Remap expanded LayerNorm (+ optional residual AddN) into
+      // _FusedLayerNorm [+ AddV2].
+      matched_nodes_map.clear();
+      remove_node_indices.clear();
+      bool fused_ln_residual = false;
+      if (FindFusedLayerNorm(&ctx, i, &matched_nodes_map, &remove_node_indices,
+                             &fused_ln_residual)) {
+        zendnnl::error_handling::apilog_info(
+            fused_ln_residual ? "Remapper: Found FusedLayerNormResidual"
+                              : "Remapper: Found FusedLayerNorm");
+        TF_RETURN_IF_ERROR(AddFusedLayerNorm(
+            &ctx, matched_nodes_map, remove_node_indices, &invalidated_nodes,
+            &nodes_to_delete, fused_ln_residual));
         continue;
       }
 

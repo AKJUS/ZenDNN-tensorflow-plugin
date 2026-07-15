@@ -28,4 +28,5 @@ void RegisterZenOps() {
   RegisterZenGroupEmbeddingOps();
   RegisterZenEmbeddingLookupSparseOps();
   RegisterZenEinsumOps();
+  RegisterZenFusedLayerNormOps();
 }

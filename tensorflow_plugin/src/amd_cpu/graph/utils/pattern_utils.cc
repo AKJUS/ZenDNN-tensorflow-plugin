@@ -104,18 +104,19 @@ inline std::vector<int> GetChildrenIndices(const OpTypePattern& pattern,
 template <>
 bool SubGraphMatcher<MatchingDirection::kFollowInputs>::DoesOpTypePatternMatch(
     const OpTypePattern& pattern, MutableNodeView* node_view,
-    NodeViewMatch* match, bool fanin_checking) {
+    NodeViewMatch* match, bool fanin_checking, bool ignore_controlled_fanouts,
+    bool ignore_controlling_fanins) {
   // Currently no control inputs and outputs are allowed.
   // But there's a situation that if a node is remained with controlling
   // fanins, we can continue to the matching.
-  if (node_view->NumControllingFanins() > 0 &&
+  if (!ignore_controlling_fanins && node_view->NumControllingFanins() > 0 &&
       (fanin_checking || pattern.node_status != NodeStatus::kRemain)) {
     zendnnl::error_handling::apilog_info(
         "Pattern: Node has control fanins, skipping");
     return false;
   }
 
-  if (node_view->NumControlledFanouts() > 0) {
+  if (!ignore_controlled_fanouts && node_view->NumControlledFanouts() > 0) {
     zendnnl::error_handling::apilog_info(
         "Pattern: Node has control fanouts, skipping");
     return false;
@@ -237,7 +238,8 @@ bool SubGraphMatcher<MatchingDirection::kFollowInputs>::DoesOpTypePatternMatch(
         match->children.push_back(NodeViewMatch());
         NodeViewMatch* child_match = &(match->children.back());
         if (!DoesOpTypePatternMatch(child_pattern, child_node_view, child_match,
-                                    fanin_checking)) {
+                                    fanin_checking, ignore_controlled_fanouts,
+                                    ignore_controlling_fanins)) {
           return false;
         }
       }
@@ -252,18 +254,27 @@ bool SubGraphMatcher<MatchingDirection::kFollowInputs>::GetMatchedNodes(
     const OpTypePattern& pattern,
     const std::unordered_set<string>& nodes_to_preserve,
     MutableNodeView* node_view, std::map<string, int>* matched_nodes_map,
-    std::set<int>* remove_node_indices, bool fanin_checking) {
+    std::set<int>* remove_node_indices, bool fanin_checking,
+    bool ignore_controlled_fanouts, bool ignore_controlling_fanins,
+    bool* matched_pattern_but_unsafe_to_remove) {
+  if (matched_pattern_but_unsafe_to_remove != nullptr) {
+    *matched_pattern_but_unsafe_to_remove = false;
+  }
   bool found_match = false;
   match_.reset(new NodeViewMatch());
-  if (DoesOpTypePatternMatch(pattern, node_view, match_.get(),
-                             fanin_checking)) {
+  if (DoesOpTypePatternMatch(pattern, node_view, match_.get(), fanin_checking,
+                             ignore_controlled_fanouts,
+                             ignore_controlling_fanins)) {
     if (IsSafeNodesToRemove(nodes_to_preserve)) {
       found_match = true;
       *matched_nodes_map = this->node_label_to_index_;
       *remove_node_indices = this->remove_node_indices_;
     } else {
+      if (matched_pattern_but_unsafe_to_remove != nullptr) {
+        *matched_pattern_but_unsafe_to_remove = true;
+      }
       zendnnl::error_handling::apilog_info(
-          "Pattern: Match found but nodes are not safe to remove");
+          "Pattern: Structure matched but nodes are not safe to remove");
     }
   } else {
     found_match = false;
